@@ -6,16 +6,20 @@ S5.5d.2c-r1 首次正式跑数为 `FAIL`（reviewer P0/P1/P2=0/2/1），失败�
 S5.5d.3a-r2 已用完整 `52976d3b` 源码重建并由同一 reviewer `PASS`（P0/P1/P2=0/0/0）；
 当前进入 S5.5e Guest 冷启动与内存优化，d.3b network/VMM overlap 延后。S5.5e.1 已完成
 Guest/Host 精确归因和 20 Pod 内存基线，同一 reviewer 已终审 `PASS`（P0/P1/P2=0/0/0）；
-当前进入 S5.5e.2 Guest 内核确定性冷启动热点优化。
+S5.5e.2 实现与云端验收已完成，同一 reviewer 第三轮终审 `PASS`（P0/P1/P2=0/0/0）；
+下一步进入 S5.5e.3，当前尚未开始内存裁剪。
 S5.3、S5.3a、S5.3b、S5.3c、S5.4a～S5.4c 与 S5.5a～S5.5d.2b 均为 `DONE`。
 用户决定先优化普通 OCI 冷启动，目标是串行 PodScheduled→Ready P95≤1.5s 并消除并发放大；
 S5.5 完成后再进入 S6.1。不得回退已验收的普通 worker 启动路径。
 
 ## 基线
 
-当前最后已提交实现为 `52976d3b`；S5.5d.2b 已完成。W2 保留 containerd
+当前实现基于 S5.5e.1 `ecba6cec`；S5.5e.2 在该提交上统一修改三个 Guest kernel config，
+仓库 `pvm_guest` SHA-256 为 `88340cb1…ace9`，云端验收 kernel 为
+`24ff4d86…50a28`。S5.5d.2b 已完成。W2 保留 containerd
 `59a92496…` 与完整源码构建的 RuntimeResource harness `9a38f91e…`，已部署 CubeShim/worker
-`d044d841…`/`cd401d89…`，保持 Ready+cordoned；`RuntimeClass/cube` 保留。W3 是 Rust
+`72ae612c…8d666`/`617d5592…59fa0`，保持 Ready+cordoned；`RuntimeClass/cube` 保留。
+`d044d841…`/`cd401d89…` 仅是 S5.5d.2c 的历史基线制品。W3 是 Rust
 精确源码构建机。W1 由 GLM 独立使用，主线未执行 TAT 或修改。
 
 ## 已完成
@@ -142,17 +146,22 @@ RunPodSandbox 重试、round spread=11.184s。Ready P95 为 1.714/2.255s。revie
 - S5.5d.2b 最终 W2/W3/控制证据包 SHA-256 为 `42bb35c1…`/`9bf89922…`/`c2a98ba2…`，
   均从 COS 反向下载复核；W3 build/audit 为 `inv-38drh50kue`/`inv-a8drnmgfhi`，五次独立
   exact-zero 均为 13 项全零，同一 reviewer `PASS`（P0/P1/P2=0）。
-- 实现 commit 为 `49313e43`；`git diff --check`、
-  credential scan、`make handoff-validate` 已通过。
+- S5.5e.1 Guest cold/memory 基线和诊断实现经同一 reviewer `PASS`（P0/P1/P2=0）；S5.5e.2
+  候选 Guest kernel 50 次串行 `PodScheduled→Ready` P50/P95/max 为
+  `1238.511/1252.179/1267.559ms`，6 Pod Cube/Guest 能力回归与最终 13 类 exact-zero
+  已通过；同一 reviewer 第三轮终审 `PASS`（P0/P1/P2=0/0/0）。
+- S5.5d.2c 基线实现 commit 为 `49313e43`；S5.5e.1 诊断实现 commit 为 `ecba6cec`；
+  S5.5e.2 Guest config 由当前提交固化。`git diff --check`、16 项性能分析器测试和
+  `make handoff-validate` 已通过。
 
 ## 阻塞
 
 GLM 的冻结分支全量 Node E2E 是独立并行验证，不占用主线 Stage，也不阻塞 S5.5；只有绑定
 commit/artifact SHA 且原始结果可复验后才接收入回归证据。GLM 当前使用的 W1 可处于
 NotReady，主线不得恢复或修改 W1。delayed gateway neighbor 的首次 CRI 可靠性已关闭。
-当前没有环境阻断；确定性性能热点是 Guest 内核启用 `CONFIG_RAID6_PQ_BENCHMARK=y`，每次
-cold boot 执行约 476ms 的 RAID6 算法自测。network prepare 完成后才启动 VMM 仍是并发
-性能债务，但已按用户决定延后。
+当前没有环境阻断；S5.5e.2 候选已关闭 Guest 的 RAID6 启动期 benchmark，并把串行
+`PodScheduled→Ready P95` 降到 `1252.179ms`。network prepare 完成后才启动 VMM 仍是并发
+性能债务，但已按用户决定延后；S5.5e.2 当前没有遗留门禁。
 
 ## 受保护路径
 
@@ -163,8 +172,8 @@ assets 和回滚副本；不得在仓库或 handoff 中记录凭证、token、�
 
 ## 下一步
 
-1. S5.5e.1 经同一 reviewer 终审后，S5.5e.2 关闭 Guest RAID6 benchmark 等确定性冷启动
-   热点并完成 50 次串行与能力回归。
+1. 提交已通过 reviewer 的 S5.5e.2 实现，进入 S5.5e.3；先冻结当前 kernel/时延基线，再
+   对 Guest 内核常驻内存逐组裁剪。
 2. S5.5e.3 缩减 Guest 内核无关常驻 code/rodata/tracing 元数据，达到 20 Pod
    `memory.current≤100MiB/Pod` 并完成能力回归。
 3. S5.5f 达到串行 P95≤1.5s、并发 P95≤1.8s，并完成受影响 Node E2E 回归；若并发仍受

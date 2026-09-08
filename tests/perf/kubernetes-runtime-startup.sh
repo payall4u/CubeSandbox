@@ -132,6 +132,14 @@ def pod_manifest(name):
         "spec": {
             "runtimeClassName": "cube",
             "nodeSelector": {"kubernetes.io/hostname": node},
+            # The performance worker stays cordoned to isolate it from unrelated
+            # cluster workloads. Keep scheduling explicit and tolerate only the
+            # taint produced by `kubectl cordon`.
+            "tolerations": [{
+                "key": "node.kubernetes.io/unschedulable",
+                "operator": "Exists",
+                "effect": "NoSchedule",
+            }],
             "terminationGracePeriodSeconds": 1,
             "containers": [{
                 "name": "idle",
