@@ -3,6 +3,7 @@
 //
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
 use std::num::ParseIntError;
 use std::path::PathBuf;
@@ -17,8 +18,9 @@ use crate::sandbox::pmem::{Pmem, HYP_AGENT_ID, HYP_OS_IMAGE_ID};
 
 use cube_hypervisor::config::{RateLimiterConfig, TokenBucketConfig};
 use cube_hypervisor::vm_config::{
-    ConsoleConfig, ConsoleOutputMode, CpuTopology, DiskConfig, FsConfig, IvshmemConfig, MacAddr,
-    NetConfig, PayloadConfig, PmemConfig, RngConfig, VmConfig as VC, VsockConfig,
+    BalloonConfig, ConsoleConfig, ConsoleOutputMode, CpuTopology, DiskConfig, FsConfig,
+    IvshmemConfig, MacAddr, NetConfig, PayloadConfig, PmemConfig, RngConfig, VmConfig as VC,
+    VsockConfig,
 };
 use cube_hypervisor::vmm_config::VmmConfig;
 
@@ -29,6 +31,8 @@ use serde::{Deserialize, Serialize};
 pub const IMAGE_PATH: &str = "/usr/local/services/cubetoolbox/cube-image/cube-guest-image-cpu.img";
 /// Independent cube-agent.ext4 (virtio-pmem1). Prefer this over baking agent into guest image.
 pub const DEFAULT_AGENT_PATH: &str = "/usr/local/services/cubetoolbox/cube-agent/cube-agent.ext4";
+/// Set to exactly `0` on the containerd service to remove the balloon device.
+pub const FREE_PAGE_REPORTING_ENV: &str = "CUBE_FREE_PAGE_REPORTING";
 
 pub const VIRTIO_FS_TAG: &str = "cubeShared";
 pub const VIRTIO_FS_ID: &str = "cube-fs";
@@ -68,11 +72,20 @@ pub struct VmConfig {
     pub serial: ConsoleConfig,
     pub console: ConsoleConfig,
     pub vsock: Option<VsockConfig>,
+    pub balloon: Option<BalloonConfig>,
     pub sys_ctrl: bool,
     pub rng: RngConfig,
 }
 
 impl VmConfig {
+    fn free_page_reporting_enabled_from(value: Option<&OsStr>) -> bool {
+        value != Some(OsStr::new("0"))
+    }
+
+    fn free_page_reporting_enabled() -> bool {
+        Self::free_page_reporting_enabled_from(std::env::var_os(FREE_PAGE_REPORTING_ENV).as_deref())
+    }
+
     /// Builtin pmem0=OS image, pmem1=agent.ext4.
     /// Keep in sync with sandbox/pmem.rs DEVICE_INDEX_OFFSET (=2).
     pub fn builtin_pmems(os_image_path: &str, agent_path: &str) -> Vec<PmemConfig> {
@@ -93,6 +106,18 @@ impl VmConfig {
     }
 
     pub fn new(os_image_path: &str, agent_path: &str) -> Self {
+        Self::new_with_free_page_reporting(
+            os_image_path,
+            agent_path,
+            Self::free_page_reporting_enabled(),
+        )
+    }
+
+    fn new_with_free_page_reporting(
+        os_image_path: &str,
+        agent_path: &str,
+        free_page_reporting: bool,
+    ) -> Self {
         let mut params = vec![
             "root=/dev/pmem0".to_string(),
             "rootflags=dax,errors=remount-ro ro".to_string(),
@@ -138,6 +163,13 @@ impl VmConfig {
             serial: console.clone(),
             console,
             vsock: None,
+            // `None` is intentional for the opt-out path: it preserves the old
+            // PCI topology for rollback and snapshot compatibility testing.
+            balloon: free_page_reporting.then_some(BalloonConfig {
+                size: 0,
+                deflate_on_oom: false,
+                free_page_reporting: true,
+            }),
             sys_ctrl: false,
             rng: RngConfig {
                 src: PathBuf::from("/dev/urandom"),
@@ -189,6 +221,7 @@ impl VmConfig {
         if let Some(vs) = self.vsock.clone() {
             vc.vsock = Some(vs)
         }
+        vc.balloon = self.balloon.clone();
         if let Some(ivshmem) = self.ivshmem.clone() {
             vc.ivshmem = Some(ivshmem)
         }
@@ -491,6 +524,7 @@ pub struct PciDeviceInfo {
 #[cfg(test)]
 mod tests {
     use cube_hypervisor::vm_config::ConsoleOutputMode;
+    use std::ffi::OsStr;
     use std::path::PathBuf;
 
     use crate::common::utils::Utils;
@@ -517,6 +551,10 @@ mod tests {
         assert!(pmem[1].discard_writes);
         assert_eq!(config.console.mode, ConsoleOutputMode::Tty);
         assert_eq!(config.rng.src, PathBuf::from("/dev/urandom"));
+        let balloon = config.balloon.as_ref().expect("balloon must be enabled");
+        assert_eq!(balloon.size, 0);
+        assert!(!balloon.deflate_on_oom);
+        assert!(balloon.free_page_reporting);
 
         let mut params = vec![
             "root=/dev/pmem0".to_string(),
@@ -567,6 +605,41 @@ mod tests {
         assert_eq!(hypervisor_config.serial.file, Some(serial_path));
         assert_eq!(hypervisor_config.console.mode, ConsoleOutputMode::File);
         assert_eq!(hypervisor_config.console.file, Some(console_path));
+    }
+
+    #[test]
+    fn free_page_reporting_survives_conversion() {
+        let config = VmConfig::new_with_free_page_reporting(IMAGE_PATH, DEFAULT_AGENT_PATH, true);
+        let hypervisor_config = config.to_vm_config();
+        let balloon = hypervisor_config
+            .balloon
+            .expect("balloon must survive conversion");
+
+        assert_eq!(balloon.size, 0);
+        assert!(!balloon.deflate_on_oom);
+        assert!(balloon.free_page_reporting);
+    }
+
+    #[test]
+    fn free_page_reporting_opt_out_removes_balloon_device() {
+        let config = VmConfig::new_with_free_page_reporting(IMAGE_PATH, DEFAULT_AGENT_PATH, false);
+
+        assert!(config.balloon.is_none());
+        assert!(config.to_vm_config().balloon.is_none());
+    }
+
+    #[test]
+    fn only_exact_zero_disables_free_page_reporting() {
+        assert!(VmConfig::free_page_reporting_enabled_from(None));
+        assert!(VmConfig::free_page_reporting_enabled_from(Some(
+            OsStr::new("1")
+        )));
+        assert!(VmConfig::free_page_reporting_enabled_from(Some(
+            OsStr::new("false")
+        )));
+        assert!(!VmConfig::free_page_reporting_enabled_from(Some(
+            OsStr::new("0")
+        )));
     }
 
     #[test]

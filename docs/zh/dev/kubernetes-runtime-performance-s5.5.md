@@ -268,6 +268,20 @@ S5.5d.2/e/f。早期 `overlap-v1` 因 duration 结束点和 Create 后、Start �
 - Guest capability、网络、volume、privileged、device、sysctl、hostname 和多容器冒烟无回归。
 - 新 Guest asset 使用独立 digest，可一条命令切回基线版本。
 
+S5.5e.3 实测采用两项相互独立的优化：PVM Guest 关闭运行时 BTF（保留 DWARF、BPF/JIT、
+kallsyms、kprobe/uprobe、ftrace、perf 和 livepatch），以及默认启用 size=0 的 virtio-balloon
+free-page reporting。后者可通过 containerd 与 watchdog 环境变量
+`CUBE_FREE_PAGE_REPORTING=0` 移除设备并恢复旧 PCI 拓扑；修改后需重启这两个服务，只影响
+新建 Pod，运行中的 VM 不热切换设备。
+
+20 Pod 三轮稳态 `memory.current` mean 为 `94.857/94.859/94.860MiB/Pod`，相对
+S5.5e.1 的 `104.93MiB/Pod` 下降约 `9.6%`，通过 `≤100MiB/Pod` 门禁。50 次串行正式
+`PodScheduled→Ready` P50/P95/max 为 `1222.148/1235.888/1254.664ms`，50/50 成功且
+没有启动回退。free-page reporting 单独对从未分配过大量内存的 idle baseline 没有显著收益；
+它的价值由 128MiB 两轮工作集压力后 Host PSS/cgroup 回落证明，不能与 BTF 常驻段节省重复
+计算。完整能力、回退和 exact-zero 证据见
+[S5.5e 阶段记录](../../handoffs/kubernetes-runtime/evidence/s5.5/s5.5e-guest-cold-memory.md)。
+
 ### S5.5f：端到端门禁与 Kubernetes 回归
 
 目标：确认局部优化真实转化为 kubelet 观察到的 Ready 延迟，并关闭所有资源和功能回归。

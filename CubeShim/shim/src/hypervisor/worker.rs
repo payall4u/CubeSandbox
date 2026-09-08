@@ -1493,10 +1493,48 @@ impl From<WorkerEvent> for NotifyEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cube_hypervisor::vm_config::BalloonConfig;
     use std::fs::File;
     use std::sync::Mutex as StdMutex;
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn create_vm_balloon_config_round_trips_over_worker_protocol() {
+        for balloon in [
+            Some(BalloonConfig {
+                size: 0,
+                deflate_on_oom: false,
+                free_page_reporting: true,
+            }),
+            None,
+        ] {
+            let mut config = VmConfig::default();
+            config.balloon = balloon.clone();
+            let request = WorkerRequest {
+                magic: PROTOCOL_MAGIC.to_string(),
+                version: PROTOCOL_VERSION,
+                request_id: 1,
+                command: WorkerCommand::CreateVm(config),
+            };
+
+            let payload = serde_json::to_vec(&request).unwrap();
+            let decoded: WorkerRequest = serde_json::from_slice(&payload).unwrap();
+            let WorkerCommand::CreateVm(config) = decoded.command else {
+                panic!("worker request changed command during serialization");
+            };
+
+            match (balloon, config.balloon) {
+                (Some(expected), Some(actual)) => {
+                    assert_eq!(actual.size, expected.size);
+                    assert_eq!(actual.deflate_on_oom, expected.deflate_on_oom);
+                    assert_eq!(actual.free_page_reporting, expected.free_page_reporting);
+                }
+                (None, None) => {}
+                _ => panic!("worker protocol changed balloon presence"),
+            }
+        }
+    }
 
     #[test]
     fn vm_fd_slots_round_trip_over_scm_rights() {
