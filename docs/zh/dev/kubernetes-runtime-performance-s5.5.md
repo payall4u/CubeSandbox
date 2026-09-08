@@ -226,6 +226,23 @@ S5.5d.2/e/f。早期 `overlap-v1` 因 duration 结束点和 Create 后、Start �
 - `CRI receive→start vm` 串行 P95≤220 ms、10 并发 P95≤300 ms。
 - 每轮 10 Pod 的 absolute VMM start 展开≤250 ms。
 
+首次正式 d.2c-r1 在 `49313e43` 上得到串行 111.431/182.333ms，但并发
+385.254/489.974ms；一次 gateway neighbor 超时还造成 CRI retry 和 11.184s round spread。
+同一 reviewer 判定 `FAIL`。Cilium CNI ADD P95=431.321ms，且成功样本全部在 network prepare
+完成后才 start-vm；因此不能只靠 group commit 或放宽门禁关闭本阶段，后续增加以下三个子阶段：
+
+### S5.5d.3：VMM 与网络关键路径解耦
+
+- **S5.5d.3a neighbor reliability**：把 gateway neighbor 获取改成 context-bounded probe/poll，
+  覆盖延迟超过 20ms 后成功、永久缺失时有界失败并完整回滚、10 并发无 CRI retry 与 exact-zero。
+- **S5.5d.3b VMM/network overlap**：优先在 TAP FD 可用后立即 start VMM，把邻居解析、TC redirect
+  和 network commit 与 Guest boot 重叠；若该边界不能满足门禁，再使用 hypervisor NIC hotplug
+  实现无 NIC preboot。`StartSandbox` 返回前必须 join VMM-ready 与 network-committed；任一分支失败
+  必须取消另一分支，状态机可在 Shim/containerd/RuntimeResource restart 后收敛。
+- **S5.5d.3c formal close**：同一新 commit/artifact/analyzer 重新执行完整串行 50、5×10 并发、
+  网络/跨节点/NetworkPolicy、创建中取消、service/worker/Shim kill 与双节点 exact-zero。不得拼接
+  不同实现结果；d.2 原门禁 140/150、220/300、spread≤250ms 与 no-retry 全部保持不变。
+
 ### S5.5e：Guest 冷启动、内存与 worker/VMM 细化
 
 目标：在不使用模板和快照的情况下，把 Guest 冷启动 P95 压到预算内。

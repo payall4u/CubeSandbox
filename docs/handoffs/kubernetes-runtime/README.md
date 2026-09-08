@@ -2,7 +2,8 @@
 
 ## 当前 Stage
 
-S5.5d.2b `DONE`，同一 reviewer 终审 `PASS`（P0/P1/P2=0）；S5.5d.2c `IN_PROGRESS`。
+S5.5d.2c-r1 首次正式跑数为 `FAIL`（reviewer P0/P1/P2=0/2/1），失败证据永久保留；
+当前进入 S5.5d.3a 邻居可靠性修复。
 S5.3、S5.3a、S5.3b、S5.3c、S5.4a～S5.4c 与 S5.5a～S5.5d.2b 均为 `DONE`。
 用户决定先优化普通 OCI 冷启动，目标是串行 PodScheduled→Ready P95≤1.5s 并消除并发放大；
 S5.5 完成后再进入 S6.1。不得回退已验收的普通 worker 启动路径。
@@ -81,9 +82,16 @@ exact-zero 全部通过。单样本 Shim create→start VM 为 107.591ms；正�
 同一 reviewer 终审 `PASS`（P0/P1/P2=0）。完整证据仍见
 [S5.5d.2 证据](./evidence/s5.5/s5.5d.2-durable-create-fastpath.md)。
 
+S5.5d.2c-r1 已在同一 `49313e43`/制品上完成首次串行 50 与 5×10 并发。串行
+Shim→VMM/CRI→VMM P95=111.431/182.333ms，通过局部门禁；并发为
+385.254/489.974ms，超过 150/300ms，且一次 Cilium gateway neighbor 20ms 超时导致
+RunPodSandbox 重试、round spread=11.184s。Ready P95 为 1.714/2.255s。reviewer 明确判定
+`FAIL`，不得拼接旧串行与新实现并发结果。证据和后续拆解见
+[S5.5d.2 证据](./evidence/s5.5/s5.5d.2-durable-create-fastpath.md)。
+
 ## 未完成
 
-- S5.5d.2c、S5.5e～S5.5f 普通冷启动性能优化。最终退出门禁为串行
+- S5.5d.3a～c、S5.5e～S5.5f 普通冷启动性能优化。最终退出门禁为串行
   P95≤1.5s、5×10 并发 P95≤1.8s，冲刺并发 P95≤1.5s。
 - S6.1、S6.2a～c、S6.3～S6.4：模板、快照与暂停恢复设计和实现；S6.2c 负责模板路径密度和
   RuntimeClass overhead 最终标定。
@@ -128,7 +136,8 @@ exact-zero 全部通过。单样本 Shim create→start VM 为 107.591ms；正�
 
 GLM 的冻结分支全量 Node E2E 是独立并行验证，不占用主线 Stage，也不阻塞 S5.5；只有绑定
 commit/artifact SHA 且原始结果可复验后才接收入回归证据。GLM 当前使用的 W1 可处于
-NotReady，主线不得恢复或修改 W1。当前没有阻止 S5.5d.2c 正式跑数与回归的明确卡点。
+NotReady，主线不得恢复或修改 W1。当前明确卡点是 delayed gateway neighbor 的首次 CRI
+可靠性，以及“network prepare 完成后才启动 VMM”的顺序导致并发 CRI→VMM 无法满足 300ms。
 
 ## 受保护路径
 
@@ -139,11 +148,12 @@ assets 和回滚副本；不得在仓库或 handoff 中记录凭证、token、�
 
 ## 下一步
 
-1. 执行 S5.5d.2c：在固定实现 commit/artifact 上完成首次 50 次串行与 5×10 并发，核对
-   Shim→VMM、CRI→VMM 和 absolute start spread 三个门禁及唯一身份绑定。
-2. 回归 DNS、ClusterIP、跨节点 PodIP、NetworkPolicy、创建中取消、containerd/Cubelet restart、
-   worker/Shim kill 与双节点 exact-zero；反向复验原始证据并取得同一 reviewer `PASS S5.5d.2`。
-3. S5.5f 达到串行 P95≤1.5s、并发 P95≤1.8s，并完成受影响 Node E2E 回归；完整方案见
+1. S5.5d.3a 用 context-bounded probe/poll 修复 delayed gateway neighbor，完成 10 并发无 retry、
+   永久缺失超时回滚、exact-zero，并取得同一 reviewer PASS。
+2. S5.5d.3b 让 VMM preboot 与 network async finalize/attach 重叠；StartSandbox 返回前 join
+   VMM-ready 与 network-committed，任一分支失败须取消另一分支并可恢复清零。
+3. S5.5d.3c 在同一新 commit/artifact/analyzer 上重跑完整 50 串行与 5×10 并发及功能/故障回归。
+4. S5.5f 达到串行 P95≤1.5s、并发 P95≤1.8s，并完成受影响 Node E2E 回归；完整方案见
    [S5.5 性能优化方案](../../zh/dev/kubernetes-runtime-performance-s5.5.md)。
-4. S5.5 后进入 S6.1；按 S6.2a 恢复链路、S6.2b 动态身份、S6.2c 性能/密度/overhead 顺序
+5. S5.5 后进入 S6.1；按 S6.2a 恢复链路、S6.2b 动态身份、S6.2c 性能/密度/overhead 顺序
    完成 RuntimeTemplate 和 S5.4d 一秒门禁，再进入 S6.3 PodSnapshot。
