@@ -3,15 +3,16 @@
 ## 当前 Stage
 
 S5.5d.2c-r1 首次正式跑数为 `FAIL`（reviewer P0/P1/P2=0/2/1），失败证据永久保留；
-当前进入 S5.5d.3a 邻居可靠性修复。
+S5.5d.3a-r2 已用完整 `52976d3b` 源码重建并由同一 reviewer `PASS`（P0/P1/P2=0/0/0）；
+当前进入 S5.5e Guest 冷启动与内存优化，d.3b network/VMM overlap 延后。
 S5.3、S5.3a、S5.3b、S5.3c、S5.4a～S5.4c 与 S5.5a～S5.5d.2b 均为 `DONE`。
 用户决定先优化普通 OCI 冷启动，目标是串行 PodScheduled→Ready P95≤1.5s 并消除并发放大；
 S5.5 完成后再进入 S6.1。不得回退已验收的普通 worker 启动路径。
 
 ## 基线
 
-当前最后已提交实现为 `49313e43`；S5.5d.2b 已完成。W2 保留 containerd
-`59a92496…` 与 RuntimeResource harness `b3822aa3…`，已部署 CubeShim/worker
+当前最后已提交实现为 `52976d3b`；S5.5d.2b 已完成。W2 保留 containerd
+`59a92496…` 与完整源码构建的 RuntimeResource harness `9a38f91e…`，已部署 CubeShim/worker
 `d044d841…`/`cd401d89…`，保持 Ready+cordoned；`RuntimeClass/cube` 保留。W3 是 Rust
 精确源码构建机。W1 由 GLM 独立使用，主线未执行 TAT 或修改。
 
@@ -74,6 +75,15 @@ root alias。W3 utils/Host 测试 1/1、82/82，W2 普通和 pre-start-vm SIGKIL
 （P0/P1/P2=0）。完整证据见
 [S5.5d.2 证据](./evidence/s5.5/s5.5d.2-durable-create-fastpath.md)。
 
+S5.5d.3a 候选 `52976d3b` 已把 delayed gateway neighbor 的有界 probe/poll 从 20ms 扩为
+250ms，并保留 context 取消。r1 因旧源码 base 遗漏 WAL 优化被 reviewer 判定无效；r2 使用完整
+806 文件源码清单重建，Builder vet/unit/race 通过。W2 5×10 共 50 Pod 的 RunPodSandbox
+count=50、neighbor error=0、`record_stage=SHARED_ROOT=0`、非零 `persist_shared_us=0`，五轮
+start spread≤101.827ms，十三项 exact-zero。三个证据包和 analyzer/focused-test 文件均已反向
+校验。Ready P95=2.290s，Shim→VMM/CRI→VMM P95=407.645/517.138ms；性能债务保留，但按用户
+优先级先进入 S5.5e。详见
+[S5.5d.3 证据](./evidence/s5.5/s5.5d.3-network-vmm-overlap.md)。
+
 S5.5d.2b 已把新 Host controller journal 升级为 schema v2：四个 controller 在任何外部写前一次
 持久化 old/target 与 owner identity，全部幂等 write/readback 后一次提交完成；schema v1 继续可
 恢复，PREPARED 第三值进入 durable DEGRADED。controller journal 正常路径由 10 次降为 2 次；
@@ -91,7 +101,8 @@ RunPodSandbox 重试、round spread=11.184s。Ready P95 为 1.714/2.255s。revie
 
 ## 未完成
 
-- S5.5d.3a～c、S5.5e～S5.5f 普通冷启动性能优化。最终退出门禁为串行
+- S5.5e～S5.5f 优先执行。S5.5d.3b/c 延后，若 Guest 优化后
+  并发仍受 network→VMM 串行依赖阻塞再恢复。最终退出门禁为串行
   P95≤1.5s、5×10 并发 P95≤1.8s，冲刺并发 P95≤1.5s。
 - S6.1、S6.2a～c、S6.3～S6.4：模板、快照与暂停恢复设计和实现；S6.2c 负责模板路径密度和
   RuntimeClass overhead 最终标定。
