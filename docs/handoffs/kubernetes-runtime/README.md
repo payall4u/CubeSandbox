@@ -9,7 +9,7 @@ S5.5 完成后再进入 S6.1。不得回退已验收的普通 worker 启动路�
 
 ## 基线
 
-当前候选尚待本次提交；S5.5d.2b 已完成。W2 保留 containerd
+当前最后已提交实现为 `49313e43`；S5.5d.2b 已完成。W2 保留 containerd
 `59a92496…` 与 RuntimeResource harness `b3822aa3…`，已部署 CubeShim/worker
 `d044d841…`/`cd401d89…`，保持 Ready+cordoned；`RuntimeClass/cube` 保留。W3 是 Rust
 精确源码构建机。W1 由 GLM 独立使用，主线未执行 TAT 或修改。
@@ -121,7 +121,7 @@ exact-zero 全部通过。单样本 Shim create→start VM 为 107.591ms；正�
 - S5.5d.2b 最终 W2/W3/控制证据包 SHA-256 为 `42bb35c1…`/`9bf89922…`/`c2a98ba2…`，
   均从 COS 反向下载复核；W3 build/audit 为 `inv-38drh50kue`/`inv-a8drnmgfhi`，五次独立
   exact-zero 均为 13 项全零，同一 reviewer `PASS`（P0/P1/P2=0）。
-- 实现 commit 待本次固化；`git diff --check`、
+- 实现 commit 为 `49313e43`；`git diff --check`、
   credential scan、`make handoff-validate` 已通过。
 
 ## 阻塞
