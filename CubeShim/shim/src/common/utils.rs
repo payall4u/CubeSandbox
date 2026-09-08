@@ -238,12 +238,17 @@ impl Utils {
     }
 
     /// Validate sandbox_id before using it in filesystem paths.
-    fn validate_sandbox_id(id: &str) -> CResult<()> {
-        if id.is_empty() || id.len() > 255 {
-            return Err("invalid sandbox_id length".into());
+    pub(crate) fn validate_sandbox_id(id: &str) -> CResult<()> {
+        if id.is_empty() || id.len() > 128 {
+            return Err("invalid sandbox_id length; expected 1..128 bytes".into());
         }
-        if id.contains("..") || id.contains('/') || id.contains('\\') {
-            return Err("sandbox_id contains invalid path characters".into());
+        if matches!(id, "." | "..")
+            || id.contains("..")
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err("sandbox_id has invalid containerd ID syntax".into());
         }
         Ok(())
     }
@@ -462,6 +467,7 @@ impl Utils {
     }
 
     pub fn clean_sandbox_resource(sandbox_id: &String) -> CResult<()> {
+        Self::validate_sandbox_id(sandbox_id)?;
         //delete vmm workdir
         let vm_dir = PathBuf::from(VM_PATH).join(sandbox_id);
         let ret_vmdir: Result<(), String> = match fs::remove_dir_all(&vm_dir) {
@@ -1318,39 +1324,59 @@ mod tests {
     fn test_ivshmem_path_traversal_dotdot() {
         let result = Utils::ivshmem_path("../etc/passwd");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid path characters"));
+        assert!(result.unwrap_err().contains("invalid containerd ID syntax"));
     }
 
     #[test]
     fn test_ivshmem_path_traversal_slash() {
         let result = Utils::ivshmem_path("foo/bar");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid path characters"));
+        assert!(result.unwrap_err().contains("invalid containerd ID syntax"));
     }
 
     #[test]
     fn test_ivshmem_path_traversal_backslash() {
         let result = Utils::ivshmem_path("foo\\bar");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid path characters"));
+        assert!(result.unwrap_err().contains("invalid containerd ID syntax"));
     }
 
     #[test]
     fn test_ivshmem_path_embedded_dotdot() {
         let result = Utils::ivshmem_path("foo..bar");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid path characters"));
+        assert!(result.unwrap_err().contains("invalid containerd ID syntax"));
     }
 
     #[test]
     fn test_ivshmem_path_max_length() {
-        let id = "a".repeat(255);
+        let id = "a".repeat(128);
         let result = Utils::ivshmem_path(&id);
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
-            PathBuf::from(format!("/dev/shm/ivshmem-{}", "a".repeat(255)))
+            PathBuf::from(format!("/dev/shm/ivshmem-{}", "a".repeat(128)))
         );
+    }
+
+    #[test]
+    fn clean_sandbox_resource_rejects_root_alias_before_removal() {
+        for id in [
+            ".",
+            "..",
+            "bad/id",
+            "bad\\id",
+            "bad:id",
+            "bad\nline",
+            "沙箱",
+        ] {
+            let result = Utils::clean_sandbox_resource(&id.to_string());
+            assert!(result.is_err(), "sandbox id {id:?} was accepted");
+            assert!(
+                result.unwrap_err().contains("invalid containerd ID syntax"),
+                "sandbox id {id:?} did not fail validation"
+            );
+        }
     }
 
     #[test]

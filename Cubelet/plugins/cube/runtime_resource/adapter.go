@@ -227,11 +227,11 @@ func (a *adapter) resumePrepare(ctx context.Context, record *diskRecord) (prepar
 		}
 		record.Assets.SharedRoot = validated
 		validateRoot += time.Since(stageStart)
-		stageStart = time.Now()
-		if err := a.persistStage(record, stageSharedRoot, trace); err != nil {
-			return nil, err
-		}
-		persistShared += time.Since(stageStart)
+		// The durable INTENT already contains the exact shared-root and network
+		// targets. If the process exits after mkdir, replaying INTENT observes
+		// and validates the same directory before idempotently preparing the
+		// network. Keep accepting the historical SHARED_ROOT stage below, but
+		// do not add an otherwise redundant file+directory fsync to new Pods.
 		fallthrough
 	case stageSharedRoot:
 		stageStart = time.Now()

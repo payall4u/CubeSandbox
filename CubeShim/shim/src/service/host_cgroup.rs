@@ -928,20 +928,7 @@ impl LifecycleOperation {
         })
     }
 
-    pub(crate) fn mark_tap_allocated(&self) -> Result<(), String> {
-        self.update_runtime_owner(|owner| {
-            if owner.tap_state != ForwardResourceState::Intent {
-                return Err(format!(
-                    "TAP allocation requires durable INTENT, found {:?}",
-                    owner.tap_state
-                ));
-            }
-            owner.tap_state = ForwardResourceState::Allocated;
-            Ok(())
-        })
-    }
-
-    pub(crate) fn mark_vm_intent(&self) -> Result<(), String> {
+    pub(crate) fn mark_tap_allocated_and_vm_intent(&self) -> Result<(), String> {
         let cleanup_identity = format!(
             "host-cgroup={};server={}:{}",
             self.target.cgroup(),
@@ -949,14 +936,19 @@ impl LifecycleOperation {
             self.identity.start_time_ticks
         );
         self.update_runtime_owner(|owner| {
-            if owner.tap_state != ForwardResourceState::Allocated
+            if owner.tap_state != ForwardResourceState::Intent
                 || owner.vm_state != ForwardResourceState::None
             {
                 return Err(format!(
-                    "VM INTENT requires allocated TAP with no prior VM state; found {:?}/{:?}",
+                    "TAP allocation and VM INTENT require durable TAP INTENT with no prior VM state; found {:?}/{:?}",
                     owner.tap_state, owner.vm_state
                 ));
             }
+            // TAP=INTENT already contains the exact provider cleanup
+            // identity, so a crash before this commit remains releasable.
+            // After TAP acquisition, publish TAP=ALLOCATED and VM=INTENT in
+            // one atomic owner generation before any VMM side effect.
+            owner.tap_state = ForwardResourceState::Allocated;
             owner.vm_state = ForwardResourceState::Intent;
             owner.vm_cleanup_identity = Some(cleanup_identity);
             Ok(())
@@ -3869,9 +3861,21 @@ where
 
 async fn scan_runtime_cleanup_queue_once(queue: &Path) -> Result<(), String> {
     scan_runtime_cleanup_queue_once_with(queue, |owner| async move {
-        runtime_resource::release_external_owner(&owner).await
+        runtime_resource::release_external_owner(&owner).await?;
+        cleanup_runtime_owner_local_resources(&owner)
     })
     .await
+}
+
+fn cleanup_runtime_owner_local_resources(owner: &RuntimeResourceOwner) -> Result<(), String> {
+    let Some(sandbox_id) = owner.sandbox_id.as_ref() else {
+        return Ok(());
+    };
+    // SandBox::init creates /run/vc/vm/<sandbox-id> before StartSandbox. A
+    // CubeShim crash before the VMM worker is spawned cannot run delete_shim,
+    // so the durable RuntimeResource cleanup consumer must own this local,
+    // idempotent cleanup too. The job is acknowledged only after it succeeds.
+    Utils::clean_sandbox_resource(sandbox_id)
 }
 
 async fn scan_runtime_cleanup_queue_once_with<F, Fut>(
@@ -5685,16 +5689,7 @@ fn classify_and_target(
 }
 
 fn validate_containerd_id(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > 128 {
-        return Err("containerd sandbox id must contain 1..128 bytes".to_string());
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(format!("containerd sandbox id has invalid syntax: {value}"));
-    }
-    Ok(())
+    Utils::validate_sandbox_id(value)
 }
 
 fn parse_host_target(path: &Path, instance_id: &str) -> Result<HostTarget, String> {
@@ -6017,28 +6012,27 @@ fn verify_systemd_placement(
         Utils::monotonic_time_micros(),
         readiness_started.elapsed().as_micros()
     );
-    const STABLE_SAMPLES: usize = 5;
+    // The readiness loop above is the event gate: it observes the leaf, the
+    // exact parent identity, and PID membership together. Re-read all three
+    // once after capturing the leaf inode. Fixed time samples cannot prove
+    // stronger ownership than this identity-bound readback and added 80 ms
+    // to every Pod. Durable ALLOCATED/CONTAINERD_COMMITTED publication later
+    // performs another exact membership check.
     let stability_started = Instant::now();
-    for sample in 0..STABLE_SAMPLES {
-        let actual = current_process_cgroup(pid)?;
-        if file_identity(parent)? != *expected_parent
-            || file_identity(&path)? != leaf_identity
-            || actual != *cgroup
-        {
-            return Err(format!(
-                "systemd placement gate failed for pid {pid}: cgroup={actual} expected={cgroup}"
-            ));
-        }
-        if sample + 1 < STABLE_SAMPLES {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    let actual = current_process_cgroup(pid)?;
+    if file_identity(parent)? != *expected_parent
+        || file_identity(&path)? != leaf_identity
+        || actual != *cgroup
+    {
+        return Err(format!(
+            "systemd placement gate failed for pid {pid}: cgroup={actual} expected={cgroup}"
+        ));
     }
     crate::cube_perf!(
-        "cube_perf component=shim operation=create phase=systemd-stability-gate sandbox_id={} operation_id={} target_pid={} samples={} ts_mono_us={} duration_us={} success=true",
+        "cube_perf component=shim operation=create phase=systemd-stability-gate sandbox_id={} operation_id={} target_pid={} samples=2 strategy=event-exact-readback ts_mono_us={} duration_us={} success=true",
         sandbox_id,
         sandbox_id,
         pid,
-        STABLE_SAMPLES,
         Utils::monotonic_time_micros(),
         stability_started.elapsed().as_micros()
     );
@@ -9217,6 +9211,37 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn runtime_owner_cleanup_removes_pre_worker_sandbox_resources() {
+        let sandbox_id = format!("s55d2a-local-cleanup-{}", uuid::Uuid::new_v4());
+        let vm_dir = PathBuf::from(crate::common::utils::VM_PATH).join(&sandbox_id);
+        if let Err(error) = fs::create_dir_all(&vm_dir) {
+            // Unprivileged and filesystem-sandboxed test runners may expose
+            // /run read-only. Privileged Host tests exercise the real path;
+            // only an explicit access/EROFS environment skips this fixture.
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(libc::EROFS)
+            {
+                return;
+            }
+            panic!("create pre-worker VM fixture {}: {error}", vm_dir.display());
+        }
+        fs::write(vm_dir.join("pre-worker-marker"), b"durable cleanup fixture").unwrap();
+
+        let owner = RuntimeResourceOwner::intent(
+            "/run/cubelet.sock".to_string(),
+            sandbox_id,
+            "lease-local-cleanup".to_string(),
+            1,
+            "allocation-local-cleanup".to_string(),
+        );
+        cleanup_runtime_owner_local_resources(&owner).unwrap();
+        assert!(!vm_dir.exists());
+
+        // Cleanup replay remains idempotent after the directory is gone.
+        cleanup_runtime_owner_local_resources(&owner).unwrap();
+    }
+
     #[tokio::test]
     async fn host_queue_replays_managed_leaf_and_socket_without_lifecycle_source() {
         let root = std::env::temp_dir().join(format!(
@@ -9671,8 +9696,7 @@ mod tests {
         start
             .mark_tap_intent("provider-release=sandbox/lease")
             .unwrap();
-        start.mark_tap_allocated().unwrap();
-        start.mark_vm_intent().unwrap();
+        start.mark_tap_allocated_and_vm_intent().unwrap();
         handle.request_cleanup("revoke at pre-start-vm").unwrap();
         assert!(start.verify().is_err());
         drop(start);
@@ -9687,6 +9711,148 @@ mod tests {
         assert_eq!(queued.owner.vm_state, ForwardResourceState::Intent);
         assert!(queued.owner.vm_cleanup_identity.is_some());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn combined_tap_and_vm_transition_is_guarded_and_atomic() {
+        let root = std::env::temp_dir().join(format!(
+            "cube-host-cgroup-combined-runtime-transition-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let handle = lifecycle_fixture(&root, LifecyclePhase::ContainerdCommitted);
+        let server = process_identity(std::process::id() as i32).unwrap();
+        handle
+            .update_record(|record| {
+                record.operation_owner = OperationOwner {
+                    kind: OwnerKind::Server,
+                    epoch: 12,
+                    identity: server,
+                    revoked_epoch: None,
+                };
+                record.create_state = CreateState::InProgress;
+                Ok(())
+            })
+            .unwrap();
+        let prepare = handle
+            .begin_runtime_intent(&RuntimeResourceOwner::intent(
+                "/run/cubelet.sock".to_string(),
+                "sandbox".to_string(),
+                "lease".to_string(),
+                1,
+                "allocation".to_string(),
+            ))
+            .unwrap();
+        prepare.mark_allocated().unwrap();
+        drop(prepare);
+        handle
+            .update_record(|record| {
+                record.create_state = CreateState::Succeeded;
+                Ok(())
+            })
+            .unwrap();
+
+        let start = handle.begin_start_operation().unwrap();
+        assert!(start.mark_tap_allocated_and_vm_intent().is_err());
+        let before = handle.runtime_owner().unwrap();
+        assert_eq!(before.tap_state, ForwardResourceState::None);
+        assert_eq!(before.vm_state, ForwardResourceState::None);
+        assert!(before.vm_cleanup_identity.is_none());
+
+        start
+            .mark_tap_intent("provider-release=sandbox/lease")
+            .unwrap();
+        start.mark_tap_allocated_and_vm_intent().unwrap();
+        let committed = handle.runtime_owner().unwrap();
+        assert_eq!(committed.tap_state, ForwardResourceState::Allocated);
+        assert_eq!(committed.vm_state, ForwardResourceState::Intent);
+        assert!(committed.vm_cleanup_identity.is_some());
+
+        assert!(start.mark_tap_allocated_and_vm_intent().is_err());
+        let after_rejected_retry = handle.runtime_owner().unwrap();
+        assert_eq!(after_rejected_retry, committed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn combined_tap_and_vm_transition_survives_every_atomic_write_failure() {
+        for (index, stage) in ["temp", "file-fsync", "rename", "parent-fsync"]
+            .into_iter()
+            .enumerate()
+        {
+            let root = std::env::temp_dir().join(format!(
+                "cube-host-cgroup-combined-runtime-fail-{stage}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let handle = lifecycle_fixture(&root, LifecyclePhase::ContainerdCommitted);
+            let server = process_identity(std::process::id() as i32).unwrap();
+            handle
+                .update_record(|record| {
+                    record.operation_owner = OperationOwner {
+                        kind: OwnerKind::Server,
+                        epoch: 20 + index as u64,
+                        identity: server,
+                        revoked_epoch: None,
+                    };
+                    record.create_state = CreateState::InProgress;
+                    Ok(())
+                })
+                .unwrap();
+            let prepare = handle
+                .begin_runtime_intent(&RuntimeResourceOwner::intent(
+                    "/run/cubelet.sock".to_string(),
+                    "sandbox".to_string(),
+                    "lease".to_string(),
+                    1,
+                    "allocation".to_string(),
+                ))
+                .unwrap();
+            prepare.mark_allocated().unwrap();
+            drop(prepare);
+            handle
+                .update_record(|record| {
+                    record.create_state = CreateState::Succeeded;
+                    Ok(())
+                })
+                .unwrap();
+
+            let start = handle.begin_start_operation().unwrap();
+            start
+                .mark_tap_intent("provider-release=sandbox/lease")
+                .unwrap();
+            File::create(atomic_write_failpoint_path(
+                &handle.directory.join(RUNTIME_OWNER_FILE),
+                stage,
+            ))
+            .unwrap();
+            assert!(start.mark_tap_allocated_and_vm_intent().is_err());
+
+            let owner = handle.runtime_owner().unwrap();
+            assert_eq!(
+                (owner.tap_state, owner.vm_state),
+                if stage == "parent-fsync" {
+                    (
+                        ForwardResourceState::Allocated,
+                        ForwardResourceState::Intent,
+                    )
+                } else {
+                    (ForwardResourceState::Intent, ForwardResourceState::None)
+                },
+                "stage={stage}"
+            );
+            assert_eq!(
+                owner.tap_cleanup_identity.as_deref(),
+                Some("provider-release=sandbox/lease"),
+                "stage={stage}"
+            );
+            assert_eq!(
+                owner.vm_cleanup_identity.is_some(),
+                stage == "parent-fsync",
+                "stage={stage}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -9979,11 +10145,14 @@ mod tests {
             })
             .unwrap();
         let old_record = handle.read_record().unwrap();
-        drop(old_listener);
+        // Keep the old socket object alive while replacing its path. If it is
+        // closed first, the filesystem may immediately reuse its inode for
+        // the new generation and make this identity-fencing test flaky.
         fs::remove_file(&socket).unwrap();
         let new_listener = UnixListener::bind(&socket).unwrap();
         let new_metadata = fs::symlink_metadata(&socket).unwrap();
         assert_ne!(old_metadata.ino(), new_metadata.ino());
+        drop(old_listener);
 
         assert!(cleanup_socket_identity(
             &old_record.socket,

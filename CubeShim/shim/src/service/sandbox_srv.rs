@@ -527,21 +527,12 @@ impl SandboxService {
             phase_started.elapsed().as_micros()
         );
         let phase_started = Instant::now();
-        if let Err(error) = operation.mark_tap_allocated() {
+        if let Err(error) = operation.mark_tap_allocated_and_vm_intent() {
             drop(tap);
             drop(operation);
             return Err(release_after_start_failure(
                 lease,
-                format!("commit TAP allocation identity: {error}"),
-            )
-            .await);
-        }
-        if let Err(error) = operation.mark_vm_intent() {
-            drop(tap);
-            drop(operation);
-            return Err(release_after_start_failure(
-                lease,
-                format!("persist VM allocation INTENT: {error}"),
+                format!("commit TAP allocation and VM INTENT: {error}"),
             )
             .await);
         }
