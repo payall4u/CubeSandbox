@@ -2,17 +2,17 @@
 
 ## 当前 Stage
 
-S5.5d.1 `DONE`，同一 reviewer 终审 `PASS`（P0/P1/P2=0）；S5.5d.2 `IN_PROGRESS`。
-S5.3、S5.3a、S5.3b、S5.3c、S5.4a～S5.4c 与 S5.5a～S5.5d.1 均为 `DONE`。
+S5.5d.2a `DONE`，同一 reviewer 终审 `PASS`（P0/P1/P2=0）；S5.5d.2b `IN_PROGRESS`。
+S5.3、S5.3a、S5.3b、S5.3c、S5.4a～S5.4c 与 S5.5a～S5.5d.2a 均为 `DONE`。
 用户决定先优化普通 OCI 冷启动，目标是串行 PodScheduled→Ready P95≤1.5s 并消除并发放大；
 S5.5 完成后再进入 S6.1。不得回退已验收的普通 worker 启动路径。
 
 ## 基线
 
-当前最后已提交实现为 `8129b3a9451b21f496f75d3faa8d8ca72ff3b265`；S5.5d.1 修复版
-`overlap-v2` 已完成。W2 已部署 containerd
-`59a92496…` 与 RuntimeResource `bd52076f…`；CubeShim/worker 沿用 `3fd76d04…`/
-`bff4e979…`。`RuntimeClass/cube` 保留。W1 由 GLM 独立使用，主线未触碰。
+当前最后已提交实现为 `1170426e`；S5.5d.2a 已完成。W2 保留 containerd
+`59a92496…` 与 RuntimeResource harness `b3822aa3…`，已部署 CubeShim/worker
+`32d3a6eb…`/`cd401d89…`，保持 Ready+cordoned；`RuntimeClass/cube` 保留。W3 是 Rust
+精确源码构建机。W1 由 GLM 独立使用，主线未执行 TAT 或修改。
 
 ## 已完成
 
@@ -64,9 +64,18 @@ exact-zero 均通过；同一 reviewer 终审 `PASS`（P0/P1/P2=0）。早期 `o
 结束点和回滚缺口已全部作废，不构成验收。详见
 [S5.5d.1 证据](./evidence/s5.5/s5.5d.1-pre-shim-fastpath.md)。
 
+S5.5d.2a 已删除 systemd 固定 4×20ms 稳定等待，保留 parent/leaf/PID 精确 identity readback；
+Cubelet 新请求的 WAL 从 `INTENT→SHARED_ROOT→PREPARED` 收敛为 `INTENT→PREPARED`，旧记录仍可
+恢复；TAP allocated 与 VM intent 合为一次原子提交。runtime cleanup queue 现在也负责 Shim 在
+worker 启动前崩溃时遗留的本地 VM 目录，并以严格 containerd ID 语法在任何 path join 前拒绝
+root alias。W3 utils/Host 测试 1/1、82/82，W2 普通和 pre-start-vm SIGKILL 两条链分别独立
+13 项 exact-zero；单样本 Shim create→start VM 为 134.482ms。同一 reviewer 终审 `PASS`
+（P0/P1/P2=0）。完整证据见
+[S5.5d.2 证据](./evidence/s5.5/s5.5d.2-durable-create-fastpath.md)。
+
 ## 未完成
 
-- S5.5d.2、S5.5e～S5.5f 普通冷启动性能优化。最终退出门禁为串行
+- S5.5d.2b～S5.5d.2c、S5.5e～S5.5f 普通冷启动性能优化。最终退出门禁为串行
   P95≤1.5s、5×10 并发 P95≤1.8s，冲刺并发 P95≤1.5s。
 - S6.1、S6.2a～c、S6.3～S6.4：模板、快照与暂停恢复设计和实现；S6.2c 负责模板路径密度和
   RuntimeClass overhead 最终标定。
@@ -98,14 +107,17 @@ exact-zero 均通过；同一 reviewer 终审 `PASS`（P0/P1/P2=0）。早期 `o
   W2/控制/W3 证据包 SHA-256 为 `3a5aa93f…`/`4d299303…`/`4dde7923…`，均通过源端
   credential/内层 checksum、COS 反向下载、Builder 解包复验和本地逐字节分析复算；同一
   reviewer 终审 `PASS`（P0/P1/P2=0）。
-- 实现 commit 为 `8129b3a9451b21f496f75d3faa8d8ca72ff3b265`；`git diff --check`、
+- S5.5d.2a 最终 W2/W3/控制证据包 SHA-256 为 `bd8f6325…`/`c61b7917…`/`a09632b0…`，
+  均从 COS 反向下载复核；W3 build/audit 为 `inv-b8dpx40cud`/`inv-98dq3g0q8d`，普通和注入
+  exact-zero 为 `inv-88dq7p0ft4`/`inv-38dqbpgtrx`，同一 reviewer `PASS`（P0/P1/P2=0）。
+- 实现 commit 为 `1170426e`；`git diff --check`、
   credential scan、`make handoff-validate` 已通过。
 
 ## 阻塞
 
 GLM 的冻结分支全量 Node E2E 是独立并行验证，不占用主线 Stage，也不阻塞 S5.5；只有绑定
 commit/artifact SHA 且原始结果可复验后才接收入回归证据。GLM 当前使用的 W1 可处于
-NotReady，主线不得恢复或修改 W1。当前没有阻止 S5.5d.2 实现与 W2/W3 验证的明确卡点。
+NotReady，主线不得恢复或修改 W1。当前没有阻止 S5.5d.2b 实现与 W2/W3 验证的明确卡点。
 
 ## 受保护路径
 
@@ -116,10 +128,10 @@ assets 和回滚副本；不得在仓库或 handoff 中记录凭证、token、�
 
 ## 下一步
 
-1. 执行 S5.5d.2；先从 S5.5d.1 的同钟域 trace 拆出 durable create、journal/fsync 和 Host cgroup
-   placement，再在不关闭 fsync/精确 readback 的前提下优化。
-2. 以 atomic persistence failpoint、worker/Shim kill、containerd/Cubelet restart 和 exact-zero
-   验证恢复语义；达到 Shim create→start-vm≤140/150ms、累计 CRI→VMM≤220/300ms。
+1. 执行 S5.5d.2b：把四个 Host controller 的逐项 journal 收敛为一次 `PREPARED` 和一次
+   `CONTROLLERS_COMMITTED`，旧 schema 继续可恢复，任何实际第三值进入 durable `DEGRADED`。
+2. 对每个 write/readback 边界执行 atomic persistence failpoint、worker/Shim kill、restart 和
+   exact-zero；同一 reviewer `PASS` 后进入 S5.5d.2c 的正式 50 串行与 5×10 并发门禁。
 3. S5.5f 达到串行 P95≤1.5s、并发 P95≤1.8s，并完成受影响 Node E2E 回归；完整方案见
    [S5.5 性能优化方案](../../zh/dev/kubernetes-runtime-performance-s5.5.md)。
 4. S5.5 后进入 S6.1；按 S6.2a 恢复链路、S6.2b 动态身份、S6.2c 性能/密度/overhead 顺序
