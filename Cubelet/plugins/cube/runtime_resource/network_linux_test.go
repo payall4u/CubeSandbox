@@ -10,6 +10,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	runtimev1 "github.com/tencentcloud/CubeSandbox/Cubelet/api/services/runtime/v1"
 	"golang.org/x/sys/unix"
@@ -98,6 +99,13 @@ type scriptedRunner struct {
 	dualStack        bool
 	gatewayHostRoute bool
 	clsact           bool
+	linkReadyAfter   int
+	linkReads        int
+	linkError        error
+	addrReadyAfter   int
+	addrReads        int
+	routeReadyAfter  int
+	routeReads       int
 }
 
 func (r *scriptedRunner) Run(_ context.Context, _ string, command ...string) ([]byte, error) {
@@ -105,6 +113,13 @@ func (r *scriptedRunner) Run(_ context.Context, _ string, command ...string) ([]
 	r.commands = append(r.commands, line)
 	switch line {
 	case "ip -j link show dev eth0":
+		r.linkReads++
+		if r.linkError != nil {
+			return nil, r.linkError
+		}
+		if r.linkReadyAfter > 0 && r.linkReads < r.linkReadyAfter {
+			return nil, errors.New("Device eth0 does not exist")
+		}
 		if r.badLink {
 			return []byte("[]"), nil
 		}
@@ -112,6 +127,10 @@ func (r *scriptedRunner) Run(_ context.Context, _ string, command ...string) ([]
 	case "ip link show dev cb123":
 		return nil, errors.New("not found")
 	case "ip -j addr show dev eth0":
+		r.addrReads++
+		if r.addrReadyAfter > 0 && r.addrReads < r.addrReadyAfter {
+			return []byte(`[{"addr_info":[]}]`), nil
+		}
 		if r.ipv6Only {
 			return []byte(`[{"addr_info":[{"local":"2001:db8::2","prefixlen":64,"scope":"global"}]}]`), nil
 		}
@@ -120,6 +139,10 @@ func (r *scriptedRunner) Run(_ context.Context, _ string, command ...string) ([]
 		}
 		return []byte(`[{"addr_info":[{"local":"10.0.0.2","prefixlen":24,"scope":"global"}]}]`), nil
 	case "ip -j -4 route show":
+		r.routeReads++
+		if r.routeReadyAfter > 0 && r.routeReads < r.routeReadyAfter {
+			return []byte(`[]`), nil
+		}
 		if r.ipv6Only {
 			return []byte(`[]`), nil
 		}
@@ -227,6 +250,41 @@ func TestLinuxNetworkPrepareBuildsTcRedirectAndGuestConfig(t *testing.T) {
 	redirect := strings.Index(joined, "tc filter replace dev eth0")
 	if neighbor < 0 || redirect < 0 || neighbor > redirect {
 		t.Fatalf("gateway neighbors must be resolved before ingress redirect: %v", runner.commands)
+	}
+}
+
+func TestLinuxNetworkWaitsForCNIInterfaceAddressAndRoute(t *testing.T) {
+	runner := &scriptedRunner{linkReadyAfter: 3, addrReadyAfter: 3, routeReadyAfter: 2}
+	attachment, err := (&linuxNetwork{runner: runner}).Prepare(context.Background(), t.TempDir(), "eth0", "cb123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.GetMac() == "" || len(attachment.GetIps()) != 1 || len(attachment.GetRoutes()) == 0 {
+		t.Fatalf("attachment=%+v", attachment)
+	}
+	if runner.linkReads < 5 || runner.addrReads < 3 || runner.routeReads < 2 {
+		t.Fatalf("readiness polls link=%d addr=%d route=%d", runner.linkReads, runner.addrReads, runner.routeReads)
+	}
+}
+
+func TestLinuxNetworkReadinessWaitHonorsContext(t *testing.T) {
+	runner := &scriptedRunner{linkReadyAfter: 1_000_000}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Millisecond)
+	defer cancel()
+	_, err := (&linuxNetwork{runner: runner}).Prepare(ctx, t.TempDir(), "eth0", "cb123")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v, want context deadline exceeded", err)
+	}
+}
+
+func TestLinuxNetworkReadinessFailsFastOnLinkLookupError(t *testing.T) {
+	runner := &scriptedRunner{linkError: errors.New("permission denied")}
+	_, err := (&linuxNetwork{runner: runner}).Prepare(context.Background(), t.TempDir(), "eth0", "cb123")
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("error=%v, want permission denied", err)
+	}
+	if runner.linkReads != 1 {
+		t.Fatalf("link reads=%d, want one fail-fast lookup", runner.linkReads)
 	}
 }
 

@@ -91,6 +91,14 @@ var execCombinedOutput = func(ctx context.Context, name string, args ...string) 
 
 type linuxNetwork struct{ runner commandRunner }
 
+type commandCNIConfiguration struct {
+	mac      string
+	mtu      uint32
+	ips      []string
+	routes   []*runtimev1.Route
+	gateways []string
+}
+
 func newLinuxNetwork() *linuxNetwork { return &linuxNetwork{runner: nsenterRunner{}} }
 
 func (n *linuxNetwork) Prepare(ctx context.Context, netnsPath, interfaceName, tapName string) (attachment *runtimev1.NetworkAttachment, err error) {
@@ -109,19 +117,16 @@ func (n *linuxNetwork) Prepare(ctx context.Context, netnsPath, interfaceName, ta
 	if _, err := os.Stat(netnsPath); err != nil {
 		return nil, err
 	}
-	linkOutput, err := n.runner.Run(ctx, netnsPath, "ip", "-j", "link", "show", "dev", interfaceName)
+	waitStarted := time.Now()
+	configuration, err := n.waitForCNIConfiguration(ctx, netnsPath, interfaceName)
+	if trace.Enabled() {
+		trace.Addf(
+			"cube_perf component=cubelet operation=create phase=cni-ready-wait backend=command sandbox_id=%s pod_uid=%s operation_id=%s interface=%s ts_mono_us=%d duration_us=%d success=%t",
+			identity.sandboxID, identity.podUID, identity.operationID, interfaceName, monotime.Micros(), time.Since(waitStarted).Microseconds(), err == nil,
+		)
+	}
 	if err != nil {
 		return nil, err
-	}
-	var links []struct {
-		Address string `json:"address"`
-		MTU     uint32 `json:"mtu"`
-	}
-	if err := json.Unmarshal(linkOutput, &links); err != nil {
-		return nil, fmt.Errorf("decode CNI interface: %w", err)
-	}
-	if len(links) != 1 || links[0].Address == "" || links[0].MTU == 0 {
-		return nil, errors.New("CNI interface response must contain one link with MAC and MTU")
 	}
 
 	if _, err := n.runner.Run(ctx, netnsPath, "ip", "link", "show", "dev", tapName); err != nil {
@@ -129,19 +134,11 @@ func (n *linuxNetwork) Prepare(ctx context.Context, netnsPath, interfaceName, ta
 			return nil, createErr
 		}
 	}
-	if _, err := n.runner.Run(ctx, netnsPath, "ip", "link", "set", "dev", tapName, "mtu", strconv.FormatUint(uint64(links[0].MTU), 10), "up"); err != nil {
+	if _, err := n.runner.Run(ctx, netnsPath, "ip", "link", "set", "dev", tapName, "mtu", strconv.FormatUint(uint64(configuration.mtu), 10), "up"); err != nil {
 		return nil, err
 	}
 
-	ips, err := n.addresses(ctx, netnsPath, interfaceName)
-	if err != nil {
-		return nil, err
-	}
-	routes, gateways, err := n.routes(ctx, netnsPath, interfaceName, ips)
-	if err != nil {
-		return nil, err
-	}
-	neighbors, err := n.neighbors(ctx, netnsPath, interfaceName, gateways)
+	neighbors, err := n.neighbors(ctx, netnsPath, interfaceName, configuration.gateways)
 	if err != nil {
 		return nil, err
 	}
@@ -164,8 +161,84 @@ func (n *linuxNetwork) Prepare(ctx context.Context, netnsPath, interfaceName, ta
 			return nil, err
 		}
 	}
-	attachment = &runtimev1.NetworkAttachment{TapName: tapName, GuestInterfaceName: "eth0", Mac: links[0].Address, Mtu: links[0].MTU, Ips: ips, Routes: routes, Neighbors: neighbors}
+	attachment = &runtimev1.NetworkAttachment{
+		TapName: tapName, GuestInterfaceName: "eth0", Mac: configuration.mac, Mtu: configuration.mtu,
+		Ips: configuration.ips, Routes: configuration.routes, Neighbors: neighbors,
+	}
 	return attachment, nil
+}
+
+func (n *linuxNetwork) waitForCNIConfiguration(ctx context.Context, netnsPath, interfaceName string) (*commandCNIConfiguration, error) {
+	deadline := time.Now().Add(cniReadyTimeout)
+	var lastPending error
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		linkOutput, err := n.runner.Run(ctx, netnsPath, "ip", "-j", "link", "show", "dev", interfaceName)
+		if err != nil {
+			if !cniLinkLookupPending(err) {
+				return nil, fmt.Errorf("find CNI interface %q: %w", interfaceName, err)
+			}
+			lastPending = err
+		} else {
+			var links []struct {
+				Address string `json:"address"`
+				MTU     uint32 `json:"mtu"`
+			}
+			if err := json.Unmarshal(linkOutput, &links); err != nil {
+				return nil, fmt.Errorf("decode CNI interface: %w", err)
+			}
+			if len(links) != 1 || links[0].Address == "" || links[0].MTU == 0 {
+				return nil, errors.New("CNI interface response must contain one link with MAC and MTU")
+			}
+
+			ips, addressErr := n.addresses(ctx, netnsPath, interfaceName)
+			if addressErr == nil {
+				routes, gateways, routeErr := n.routes(ctx, netnsPath, interfaceName, ips)
+				if routeErr == nil {
+					return &commandCNIConfiguration{
+						mac: links[0].Address, mtu: links[0].MTU, ips: ips, routes: routes, gateways: gateways,
+					}, nil
+				}
+				if !cniConfigurationPending(routeErr) {
+					return nil, routeErr
+				}
+				lastPending = routeErr
+			} else {
+				if !cniConfigurationPending(addressErr) {
+					return nil, addressErr
+				}
+				lastPending = addressErr
+			}
+		}
+
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("wait for CNI interface %q configuration: %w", interfaceName, lastPending)
+		}
+		wait := cniReadyPollInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func cniLinkLookupPending(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "does not exist") ||
+		strings.Contains(message, "cannot find device")
 }
 
 func (n *linuxNetwork) ensureIngress(ctx context.Context, netnsPath, device string) (string, error) {

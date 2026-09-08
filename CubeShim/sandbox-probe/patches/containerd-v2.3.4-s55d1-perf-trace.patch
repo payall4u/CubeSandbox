@@ -1,6 +1,6 @@
---- a/core/runtime/v2/binary.go	2026-08-30 19:48:02.220730347 +0800
-+++ b/core/runtime/v2/binary.go	2026-09-08 00:38:57.265311898 +0800
-@@ -27,6 +27,7 @@
+--- a/core/runtime/v2/binary.go
++++ b/core/runtime/v2/binary.go
+@@ -27,6 +27,7 @@ import (
  
  	"github.com/containerd/containerd/api/runtime/task/v2"
  	"github.com/containerd/containerd/v2/core/runtime"
@@ -8,7 +8,7 @@
  	"github.com/containerd/containerd/v2/pkg/namespaces"
  	"github.com/containerd/containerd/v2/pkg/protobuf"
  	"github.com/containerd/containerd/v2/pkg/protobuf/proto"
-@@ -64,8 +65,10 @@
+@@ -64,8 +65,10 @@ type binary struct {
  }
  
  func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ *shim, err error) {
@@ -19,7 +19,7 @@
  	cmd, err := client.Command( //nolint:staticcheck // SA1019
  		ctx,
  		&client.CommandConfig{
-@@ -83,6 +86,7 @@
+@@ -83,6 +86,7 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_
  	if err != nil {
  		return nil, err
  	}
@@ -27,7 +27,7 @@
  	// Windows needs a namespace when openShimLog
  	ns, _ := namespaces.Namespace(ctx)
  	shimCtx, cancelShimLog := context.WithCancel(namespaces.WithNamespace(context.Background(), ns))
-@@ -91,10 +95,12 @@
+@@ -91,10 +95,12 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_
  			cancelShimLog()
  		}
  	}()
@@ -40,7 +40,7 @@
  	defer func() {
  		if err != nil {
  			f.Close()
-@@ -114,34 +120,44 @@
+@@ -114,34 +120,44 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_
  			log.G(ctx).WithError(err).Error("copy shim log")
  		}
  	}()
@@ -85,9 +85,9 @@
  	// The address is in the form like ttrpc+unix://<uds-path> or grpc+vsock://<cid>:<port>
  	address := fmt.Sprintf("%s+%s", params.Protocol, params.Address)
  	return &shim{
---- a/core/runtime/v2/shim_manager.go	2026-08-30 19:48:02.221730344 +0800
-+++ b/core/runtime/v2/shim_manager.go	2026-09-08 00:39:01.701300206 +0800
-@@ -39,6 +39,7 @@
+--- a/core/runtime/v2/shim_manager.go
++++ b/core/runtime/v2/shim_manager.go
+@@ -39,6 +39,7 @@ import (
  	"github.com/containerd/containerd/v2/core/metadata"
  	"github.com/containerd/containerd/v2/core/runtime"
  	"github.com/containerd/containerd/v2/core/sandbox"
@@ -95,7 +95,7 @@
  	"github.com/containerd/containerd/v2/pkg/namespaces"
  	shimbinary "github.com/containerd/containerd/v2/pkg/shim"
  	"github.com/containerd/containerd/v2/pkg/timeout"
-@@ -307,6 +308,7 @@
+@@ -307,6 +308,7 @@ func (m *ShimManager) Start(ctx context.Context, id string, bundle *Bundle, opts
  }
  
  func (m *ShimManager) startShim(ctx context.Context, bundle *Bundle, id string, opts runtime.CreateOpts) (*shim, error) {
@@ -103,7 +103,7 @@
  	ns, err := namespaces.NamespaceRequired(ctx)
  	if err != nil {
  		return nil, err
-@@ -318,10 +320,12 @@
+@@ -318,10 +320,12 @@ func (m *ShimManager) startShim(ctx context.Context, bundle *Bundle, id string,
  		topts = opts.RuntimeOptions
  	}
  
@@ -116,7 +116,7 @@
  
  	b := shimBinary(bundle, shimBinaryConfig{
  		runtime:      runtimePath,
-@@ -330,6 +334,7 @@
+@@ -330,6 +334,7 @@ func (m *ShimManager) startShim(ctx context.Context, bundle *Bundle, id string,
  		socketDir:    m.socketDir,
  		env:          m.env,
  	})
@@ -124,7 +124,7 @@
  	shim, err := b.Start(ctx, typeurl.MarshalProto(topts), func() {
  		log.G(ctx).WithField("id", id).Info("shim disconnected")
  
-@@ -343,6 +348,7 @@
+@@ -343,6 +348,7 @@ func (m *ShimManager) startShim(ctx context.Context, bundle *Bundle, id string,
  	if err != nil {
  		return nil, fmt.Errorf("start failed: %w", err)
  	}
@@ -132,9 +132,48 @@
  
  	return shim, nil
  }
---- a/internal/cri/instrument/instrumented_service.go	2026-08-30 19:48:02.237730300 +0800
-+++ b/internal/cri/instrument/instrumented_service.go	2026-09-08 00:39:01.701300206 +0800
-@@ -24,6 +24,7 @@
+--- a/internal/cri/config/config.go
++++ b/internal/cri/config/config.go
+@@ -125,6 +125,12 @@ type Runtime struct {
+ 	// shim - means use whatever Controller implementation provided by shim (e.g. use RemoteController).
+ 	// podsandbox - means use Controller implementation from sbserver podsandbox package.
+ 	Sandboxer string `toml:"sandboxer" json:"sandboxer"`
++	// SandboxCreateBeforeNetwork allows an external shim sandbox controller to
++	// initialize concurrently with CNI ADD. The CRI service still waits for both
++	// operations before Start, and tears the controller down if CNI fails.
++	// Runtimes must tolerate Create observing a not-yet-configured network
++	// namespace and fence network-dependent work until the CNI interface is ready.
++	SandboxCreateBeforeNetwork bool `toml:"sandbox_create_before_network" json:"sandboxCreateBeforeNetwork"`
+ 	// IOType defines how containerd transfer the io streams of the container
+ 	// if it is not set, the named pipe will be created for the container
+ 	// we can also set it to "streaming" to create a stream by streaming api,
+@@ -677,6 +683,9 @@ func ValidateRuntimeConfig(ctx context.Context, c *RuntimeConfig) ([]deprecation
+ 			r.Sandboxer = string(ModePodSandbox)
+ 			c.ContainerdConfig.Runtimes[k] = r
+ 		}
++		if err := validateSandboxCreateBeforeNetwork(k, r); err != nil {
++			return warnings, err
++		}
+ 
+ 		if len(r.IOType) == 0 {
+ 			r.IOType = IOTypeFifo
+@@ -716,6 +725,13 @@ func ValidateRuntimeConfig(ctx context.Context, c *RuntimeConfig) ([]deprecation
+ 	return warnings, nil
+ }
+ 
++func validateSandboxCreateBeforeNetwork(name string, runtime Runtime) error {
++	if runtime.SandboxCreateBeforeNetwork && runtime.Sandboxer != string(ModeShim) {
++		return fmt.Errorf("runtime %s: `sandbox_create_before_network` requires `sandboxer = %q`", name, ModeShim)
++	}
++	return nil
++}
++
+ // ValidateServerConfig validates the given server configuration.
+ func ValidateServerConfig(ctx context.Context, c *ServerConfig) ([]deprecation.Warning, error) {
+ 	var warnings []deprecation.Warning
+--- a/internal/cri/instrument/instrumented_service.go
++++ b/internal/cri/instrument/instrumented_service.go
+@@ -24,6 +24,7 @@ import (
  	"github.com/containerd/log"
  	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
  
@@ -142,7 +181,7 @@
  	"github.com/containerd/containerd/v2/pkg/tracing"
  
  	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
-@@ -69,9 +70,14 @@
+@@ -69,9 +70,14 @@ func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.Run
  	if err := in.checkInitialized(); err != nil {
  		return nil, err
  	}
@@ -157,9 +196,9 @@
  		if err != nil {
  			log.G(ctx).WithError(err).Errorf("RunPodSandbox for %+v failed, error", r.GetConfig().GetMetadata())
  		} else {
---- a/internal/cri/server/sandbox_run.go	2026-08-30 19:48:02.243730284 +0800
-+++ b/internal/cri/server/sandbox_run.go	2026-09-08 00:39:01.701300206 +0800
-@@ -40,6 +40,7 @@
+--- a/internal/cri/server/sandbox_run.go
++++ b/internal/cri/server/sandbox_run.go
+@@ -40,6 +40,7 @@ import (
  	"github.com/containerd/containerd/v2/internal/cri/server/podsandbox"
  	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
  	"github.com/containerd/containerd/v2/internal/cri/util"
@@ -167,7 +206,95 @@
  	"github.com/containerd/containerd/v2/pkg/netns"
  	"github.com/containerd/containerd/v2/pkg/tracing"
  )
-@@ -67,6 +68,8 @@
+@@ -49,6 +50,87 @@ func init() {
+ 		"github.com/containerd/cri/pkg/store/sandbox", "Metadata")
+ }
+ 
++type sandboxNetworkSetupResult struct {
++	err                     error
++	canceledByCreateFailure bool
++}
++
++func sandboxCreateNetworkError(id string, network sandboxNetworkSetupResult, createErr error) error {
++	if createErr != nil {
++		createFailure := fmt.Errorf("failed to create sandbox %q: %w", id, createErr)
++		if network.err == nil || (network.canceledByCreateFailure && errors.Is(network.err, context.Canceled)) {
++			return createFailure
++		}
++		return errors.Join(
++			createFailure,
++			fmt.Errorf("failed to setup network for sandbox %q: %w", id, network.err),
++		)
++	}
++	if network.err != nil {
++		return fmt.Errorf("failed to setup network for sandbox %q: %w", id, network.err)
++	}
++	return nil
++}
++
++func createSandboxWhileSettingUpNetwork(
++	ctx context.Context,
++	setupNetwork func(context.Context) error,
++	createSandbox func() error,
++	shutdownSandbox func() error,
++) (sandboxNetworkSetupResult, error, error) {
++	networkCtx, cancelNetwork := context.WithCancel(ctx)
++	defer cancelNetwork()
++	networkStarted := make(chan struct{})
++	networkDone := make(chan sandboxNetworkSetupResult, 1)
++	go func() {
++		started := cubeperf.Now()
++		close(networkStarted)
++		err := setupNetwork(networkCtx)
++		cubeperf.End(ctx, "cni-setup", started)
++		networkDone <- sandboxNetworkSetupResult{err: err}
++	}()
++	<-networkStarted
++
++	createErr := createSandbox()
++	canceledByCreateFailure := createErr != nil
++	if canceledByCreateFailure {
++		cancelNetwork()
++	}
++	completed := <-networkDone
++	completed.canceledByCreateFailure = canceledByCreateFailure
++	if completed.err != nil && createErr == nil {
++		return completed, nil, shutdownSandbox()
++	}
++	return completed, createErr, nil
++}
++
++func startCreatedSandboxWithRollback(
++	persistNetwork func() error,
++	ensurePause func() error,
++	startSandbox func() (sb.ControllerInstance, error),
++	shutdownSandbox func() error,
++) (ctrl sb.ControllerInstance, cleanupErr, retErr error) {
++	defer func() {
++		if retErr == nil {
++			return
++		}
++		if err := shutdownSandbox(); err != nil && !errdefs.IsNotFound(err) {
++			cleanupErr = fmt.Errorf("shutdown sandbox after pre-start failure: %w", err)
++		}
++	}()
++
++	if persistNetwork != nil {
++		if err := persistNetwork(); err != nil {
++			return sb.ControllerInstance{}, nil, err
++		}
++	}
++	if err := ensurePause(); err != nil {
++		return sb.ControllerInstance{}, nil, err
++	}
++	ctrl, retErr = startSandbox()
++	return
++}
++
+ // RunPodSandbox creates and starts a pod-level sandbox. Runtimes should ensure
+ // the sandbox is in ready state.
+ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (_ *runtime.RunPodSandboxResponse, retErr error) {
+@@ -67,6 +149,8 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  		return nil, errors.New("sandbox config must include metadata")
  	}
  	name := makeSandboxName(metadata)
@@ -176,7 +303,7 @@
  
  	span.SetAttributes(
  		tracing.Attribute("sandbox.id", id),
-@@ -82,9 +85,11 @@
+@@ -82,9 +166,11 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  
  	// Reserve the sandbox name to avoid concurrent `RunPodSandbox` request starting the
  	// same sandbox.
@@ -188,7 +315,7 @@
  	defer func() {
  		// Release the name if the function returns with an error.
  		// When cleanupErr != nil, the name will be cleaned in sandbox_remove.
-@@ -94,10 +99,12 @@
+@@ -94,10 +180,12 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  	}()
  
  	leaseSvc := c.client.LeasesService()
@@ -201,7 +328,7 @@
  	defer func() {
  		if retErr != nil {
  			deferCtx, deferCancel := util.DeferContext()
-@@ -114,16 +121,19 @@
+@@ -114,16 +202,19 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  		sandboxInfo = sb.Sandbox{ID: id}
  	)
  
@@ -221,7 +348,7 @@
  	runtimeOpts, err := criconfig.GenerateRuntimeOptions(ociRuntime)
  	if err != nil {
  		return nil, fmt.Errorf("failed to generate sandbox runtime options: %w", err)
-@@ -135,6 +145,7 @@
+@@ -135,6 +226,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  			return nil, fmt.Errorf("failed to marshal runtime options: %w", err)
  		}
  	}
@@ -229,7 +356,7 @@
  
  	// Save sandbox name
  	sandboxInfo.AddLabel("name", name)
-@@ -158,9 +169,11 @@
+@@ -158,9 +250,11 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  		return nil, fmt.Errorf("unable to update extensions for sandbox %q: %w", id, err)
  	}
  
@@ -241,7 +368,37 @@
  	defer func() {
  		if retErr != nil && cleanupErr == nil {
  			cleanupErr = c.client.SandboxStore().Delete(ctx, id)
-@@ -206,14 +219,17 @@
+@@ -192,7 +286,29 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
+ 		}
+ 	}
+ 
++	shutdownCreatedSandbox := func() error {
++		deferCtx, deferCancel := util.DeferContext()
++		defer deferCancel()
++		return c.sandboxService.ShutdownSandbox(deferCtx, sandbox.Sandboxer, id)
++	}
++	persistSandboxNetwork := func() error {
++		if err := sandboxInfo.AddExtension(podsandbox.MetadataKey, &sandbox.Metadata); err != nil {
++			return fmt.Errorf("unable to update extensions for sandbox %q: %w", id, err)
++		}
++		stageStart = cubeperf.Now()
++		updated, err := c.client.SandboxStore().Update(ctx, sandboxInfo, "extensions")
++		if err != nil {
++			return fmt.Errorf("unable to save sandbox %q to sandbox store: %w", id, err)
++		}
++		sandboxInfo = updated
++		cubeperf.End(ctx, "sandbox-store-network-update", stageStart)
++		return nil
++	}
++
+ 	// Setup the network namespace if host networking wasn't requested.
++	createBeforeNetwork := false
++	createCompleted := false
++	var persistNetworkAfterCreate func() error
+ 	if !hostNetwork(config) {
+ 		span.AddEvent("setup pod network")
+ 		netStart := time.Now()
+@@ -206,14 +322,17 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  		}
  
  		if !userNsEnabled {
@@ -259,7 +416,7 @@
  		// Update network namespace in the store, which is used to generate the container's spec
  		sandbox.NetNSPath = sandbox.NetNS.GetPath()
  		defer func() {
-@@ -231,9 +247,11 @@
+@@ -231,9 +350,11 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  			return nil, fmt.Errorf("unable to update extensions for sandbox %q: %w", id, err)
  		}
  		// Save sandbox metadata to store
@@ -271,60 +428,133 @@
  		// Define this defer to teardownPodNetwork prior to the setupPodNetwork function call.
  		// This is because in setupPodNetwork the resource is allocated even if it returns error, unlike other resource
  		// creation functions.
-@@ -263,9 +281,11 @@
+@@ -263,23 +384,55 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  		// In this case however caching the IP will add a subtle performance enhancement by avoiding
  		// calls to network namespace of the pod to query the IP of the veth interface on every
  		// SandboxStatus request.
-+		stageStart = cubeperf.Now()
- 		if err := c.setupPodNetwork(ctx, &sandbox); err != nil {
- 			return nil, fmt.Errorf("failed to setup network for sandbox %q: %w", id, err)
+-		if err := c.setupPodNetwork(ctx, &sandbox); err != nil {
+-			return nil, fmt.Errorf("failed to setup network for sandbox %q: %w", id, err)
+-		}
+-		sandboxCreateNetworkTimer.UpdateSince(netStart)
+-
+-		if err := sandboxInfo.AddExtension(podsandbox.MetadataKey, &sandbox.Metadata); err != nil {
+-			return nil, fmt.Errorf("unable to update extensions for sandbox %q: %w", id, err)
+-		}
+-
+-		// Save sandbox metadata to store
+-		if sandboxInfo, err = c.client.SandboxStore().Update(ctx, sandboxInfo, "extensions"); err != nil {
+-			return nil, fmt.Errorf("unable to save sandbox %q to sandbox store: %w", id, err)
++		createBeforeNetwork = ociRuntime.SandboxCreateBeforeNetwork
++		if createBeforeNetwork {
++			network, createErr, shutdownErr := createSandboxWhileSettingUpNetwork(
++				ctx,
++				func(networkCtx context.Context) error {
++					defer sandboxCreateNetworkTimer.UpdateSince(netStart)
++					return c.setupPodNetwork(networkCtx, &sandbox)
++				},
++				func() error {
++					started := cubeperf.Now()
++					err := c.sandboxService.CreateSandbox(ctx, sandboxInfo, sb.WithOptions(config), sb.WithNetNSPath(sandbox.NetNSPath))
++					cubeperf.End(ctx, "controller-create", started)
++					return err
++				},
++				func() error {
++					deferCtx, deferCancel := util.DeferContext()
++					defer deferCancel()
++					return c.sandboxService.ShutdownSandbox(deferCtx, sandbox.Sandboxer, id)
++				},
++			)
++			if network.err != nil && createErr == nil {
++				if shutdownErr != nil && !errdefs.IsNotFound(shutdownErr) {
++					cleanupErr = fmt.Errorf("shutdown sandbox after network setup failure: %w", shutdownErr)
++				}
++			}
++			if err := sandboxCreateNetworkError(id, network, createErr); err != nil {
++				return nil, err
++			}
++			createCompleted = true
++			persistNetworkAfterCreate = persistSandboxNetwork
++		} else {
++			stageStart = cubeperf.Now()
++			if err := c.setupPodNetwork(ctx, &sandbox); err != nil {
++				return nil, fmt.Errorf("failed to setup network for sandbox %q: %w", id, err)
++			}
++			cubeperf.End(ctx, "cni-setup", stageStart)
++			sandboxCreateNetworkTimer.UpdateSince(netStart)
++			if err := persistSandboxNetwork(); err != nil {
++				return nil, err
++			}
  		}
-+		cubeperf.End(ctx, "cni-setup", stageStart)
- 		sandboxCreateNetworkTimer.UpdateSince(netStart)
- 
- 		if err := sandboxInfo.AddExtension(podsandbox.MetadataKey, &sandbox.Metadata); err != nil {
-@@ -273,14 +293,18 @@
- 		}
- 
- 		// Save sandbox metadata to store
-+		stageStart = cubeperf.Now()
- 		if sandboxInfo, err = c.client.SandboxStore().Update(ctx, sandboxInfo, "extensions"); err != nil {
- 			return nil, fmt.Errorf("unable to save sandbox %q to sandbox store: %w", id, err)
- 		}
-+		cubeperf.End(ctx, "sandbox-store-network-update", stageStart)
  	}
  
-+	stageStart = cubeperf.Now()
- 	if err := c.sandboxService.CreateSandbox(ctx, sandboxInfo, sb.WithOptions(config), sb.WithNetNSPath(sandbox.NetNSPath)); err != nil {
- 		return nil, fmt.Errorf("failed to create sandbox %q: %w", id, err)
+-	if err := c.sandboxService.CreateSandbox(ctx, sandboxInfo, sb.WithOptions(config), sb.WithNetNSPath(sandbox.NetNSPath)); err != nil {
+-		return nil, fmt.Errorf("failed to create sandbox %q: %w", id, err)
++	if !createCompleted {
++		stageStart = cubeperf.Now()
++		if err := c.sandboxService.CreateSandbox(ctx, sandboxInfo, sb.WithOptions(config), sb.WithNetNSPath(sandbox.NetNSPath)); err != nil {
++			return nil, fmt.Errorf("failed to create sandbox %q: %w", id, err)
++		}
++		cubeperf.End(ctx, "controller-create", stageStart)
  	}
-+	cubeperf.End(ctx, "controller-create", stageStart)
  
  	// HACK: Ensure pause container image is present before starting the sandbox.
- 	// Ideally, this should be called from the sandbox implementation itself, but it's
-@@ -292,10 +316,13 @@
+@@ -292,24 +445,40 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  	// containers anyway, the CRI layer will pre-pull the pause container to guarantee
  	// it exists (even though it's counter to the purpose of the sandbox API). This may
  	// be removed/deprecated in the distant future, if we decide to remove pause containers.
-+	stageStart = cubeperf.Now()
- 	if err := c.ensurePauseImageExists(ctx, r.GetConfig(), r.GetRuntimeHandler()); err != nil {
- 		return nil, err
- 	}
-+	cubeperf.End(ctx, "pause-image", stageStart)
+-	if err := c.ensurePauseImageExists(ctx, r.GetConfig(), r.GetRuntimeHandler()); err != nil {
+-		return nil, err
+-	}
++	ctrl, preStartCleanupErr, err := startCreatedSandboxWithRollback(
++		persistNetworkAfterCreate,
++		func() error {
++			started := cubeperf.Now()
++			defer cubeperf.End(ctx, "pause-image", started)
++			return c.ensurePauseImageExists(ctx, r.GetConfig(), r.GetRuntimeHandler())
++		},
++		func() (sb.ControllerInstance, error) {
++			started := cubeperf.Now()
++			defer cubeperf.End(ctx, "controller-start", started)
++			ctrl, startErr := c.sandboxService.StartSandbox(ctx, sandbox.Sandboxer, id)
++			if startErr == nil {
++				return ctrl, nil
++			}
++			var cerr podsandbox.CleanupErr
++			if errors.As(startErr, &cerr) {
++				cleanupErr = fmt.Errorf("failed to cleanup sandbox: %w", cerr)
  
-+	stageStart = cubeperf.Now()
- 	ctrl, err := c.sandboxService.StartSandbox(ctx, sandbox.Sandboxer, id)
- 	if err != nil {
- 		var cerr podsandbox.CleanupErr
-@@ -311,6 +338,7 @@
- 		}
- 		return nil, fmt.Errorf("failed to start sandbox %q: %w", id, err)
+-	ctrl, err := c.sandboxService.StartSandbox(ctx, sandbox.Sandboxer, id)
+-	if err != nil {
+-		var cerr podsandbox.CleanupErr
+-		if errors.As(err, &cerr) {
+-			cleanupErr = fmt.Errorf("failed to cleanup sandbox: %w", cerr)
+-
+-			// Strip last error as cleanup error to handle separately
+-			if merr, ok := err.(interface{ Unwrap() []error }); ok {
+-				if errs := merr.Unwrap(); len(errs) > 0 {
+-					err = errs[0]
++				// Strip last error as cleanup error to handle separately.
++				if merr, ok := startErr.(interface{ Unwrap() []error }); ok {
++					if errs := merr.Unwrap(); len(errs) > 0 {
++						startErr = errs[0]
++					}
+ 				}
+ 			}
+-		}
+-		return nil, fmt.Errorf("failed to start sandbox %q: %w", id, err)
++			return sb.ControllerInstance{}, fmt.Errorf("failed to start sandbox %q: %w", id, startErr)
++		},
++		shutdownCreatedSandbox,
++	)
++	if preStartCleanupErr != nil {
++		cleanupErr = errors.Join(cleanupErr, preStartCleanupErr)
++	}
++	if err != nil {
++		return nil, err
  	}
-+	cubeperf.End(ctx, "controller-start", stageStart)
  
  	// Shutdown the sandbox if we fail before adding it to store.
- 	rollbackSandbox := true
-@@ -332,9 +360,11 @@
+@@ -332,9 +501,11 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  	sandboxInfo.Labels = ctrl.Labels
  	sandboxInfo.Spec = ctrl.Spec
  
@@ -336,7 +566,7 @@
  
  	labels := ctrl.Labels
  	if labels == nil {
-@@ -353,10 +383,12 @@
+@@ -353,10 +524,12 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  
  	defer c.nri.BlockPluginSync().Unblock()
  
@@ -349,7 +579,7 @@
  
  	defer func() {
  		if retErr != nil {
-@@ -375,9 +407,11 @@
+@@ -375,9 +548,11 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  	}
  
  	// Add sandbox into sandbox store in INIT state.
@@ -361,7 +591,7 @@
  	// We no longer need to stop sandbox with a cleanup defer since it is in the store.
  	rollbackSandbox = false
  
-@@ -386,10 +420,12 @@
+@@ -386,10 +561,12 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  	// SandboxStatus from the store and include it in the event.
  	c.generateAndSendContainerEvent(ctx, id, id, runtime.ContainerEventType_CONTAINER_CREATED_EVENT)
  
@@ -374,7 +604,7 @@
  
  	// start the monitor after adding sandbox into the store, this ensures
  	// that sandbox is in the store, when event monitor receives the TaskExit event.
-@@ -402,6 +438,7 @@
+@@ -402,6 +579,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
  	c.generateAndSendContainerEvent(ctx, id, id, runtime.ContainerEventType_CONTAINER_STARTED_EVENT)
  
  	sandboxRuntimeCreateTimer.WithValues(labels["oci_runtime_type"]).UpdateSince(runtimeStart)
@@ -382,8 +612,391 @@
  
  	return &runtime.RunPodSandboxResponse{PodSandboxId: id}, nil
  }
---- a/pkg/cubeperf/clock_linux.go	1970-01-01 08:00:00.000000000 +0800
-+++ b/pkg/cubeperf/clock_linux.go	2026-09-08 00:39:01.699300211 +0800
+--- a/plugins/sandbox/controller.go
++++ b/plugins/sandbox/controller.go
+@@ -39,6 +39,7 @@ import (
+ 	"github.com/containerd/containerd/v2/core/runtime"
+ 	v2 "github.com/containerd/containerd/v2/core/runtime/v2"
+ 	"github.com/containerd/containerd/v2/core/sandbox"
++	"github.com/containerd/containerd/v2/pkg/cubeperf"
+ 	"github.com/containerd/containerd/v2/plugins"
+ )
+ 
+@@ -123,24 +124,30 @@ func (c *controllerLocal) cleanupShim(ctx context.Context, sandboxID string, svc
+ func (c *controllerLocal) Create(ctx context.Context, info sandbox.Sandbox, opts ...sandbox.CreateOpt) (retErr error) {
+ 	var coptions sandbox.CreateOptions
+ 	sandboxID := info.ID
++	cubeperf.Point(ctx, "controller-create-begin")
+ 	for _, opt := range opts {
+ 		opt(&coptions)
+ 	}
+ 
++	stageStart := cubeperf.Now()
+ 	if _, err := c.shims.Get(ctx, sandboxID); err == nil {
+ 		return fmt.Errorf("sandbox %s already running: %w", sandboxID, errdefs.ErrAlreadyExists)
+ 	}
++	cubeperf.End(ctx, "shim-cache-probe", stageStart)
+ 
++	stageStart = cubeperf.Now()
+ 	bundle, err := v2.NewBundle(ctx, c.root, c.state, sandboxID, info.Spec)
+ 	if err != nil {
+ 		return err
+ 	}
++	cubeperf.End(ctx, "bundle-create", stageStart)
+ 	defer func() {
+ 		if retErr != nil {
+ 			bundle.Delete()
+ 		}
+ 	}()
+ 
++	stageStart = cubeperf.Now()
+ 	shim, err := c.shims.Start(ctx, sandboxID, bundle, runtime.CreateOpts{
+ 		Spec:           info.Spec,
+ 		RuntimeOptions: info.Runtime.Options,
+@@ -150,12 +157,16 @@ func (c *controllerLocal) Create(ctx context.Context, info sandbox.Sandbox, opts
+ 	if err != nil {
+ 		return fmt.Errorf("failed to start new shim for sandbox %s: %w", sandboxID, err)
+ 	}
++	cubeperf.End(ctx, "shim-manager-start", stageStart)
+ 
++	stageStart = cubeperf.Now()
+ 	svc, err := sandbox.NewClient(shim.Client())
+ 	if err != nil {
+ 		return err
+ 	}
++	cubeperf.End(ctx, "sandbox-client", stageStart)
+ 
++	stageStart = cubeperf.Now()
+ 	if _, err := svc.CreateSandbox(ctx, &runtimeAPI.CreateSandboxRequest{
+ 		SandboxID:   sandboxID,
+ 		BundlePath:  shim.Bundle(),
+@@ -167,26 +178,35 @@ func (c *controllerLocal) Create(ctx context.Context, info sandbox.Sandbox, opts
+ 		c.cleanupShim(ctx, sandboxID, svc)
+ 		return fmt.Errorf("failed to create sandbox %s: %w", sandboxID, errgrpc.ToNative(err))
+ 	}
++	cubeperf.End(ctx, "shim-create-rpc", stageStart)
++	cubeperf.Point(ctx, "controller-create-complete")
+ 
+ 	return nil
+ }
+ 
+ func (c *controllerLocal) Start(ctx context.Context, sandboxID string) (sandbox.ControllerInstance, error) {
++	cubeperf.Point(ctx, "controller-start-begin")
++	stageStart := cubeperf.Now()
+ 	shim, err := c.shims.Get(ctx, sandboxID)
+ 	if err != nil {
+ 		return sandbox.ControllerInstance{}, fmt.Errorf("unable to find sandbox %q", sandboxID)
+ 	}
++	cubeperf.End(ctx, "start-shim-cache-get", stageStart)
+ 
++	stageStart = cubeperf.Now()
+ 	svc, err := sandbox.NewClient(shim.Client())
+ 	if err != nil {
+ 		return sandbox.ControllerInstance{}, err
+ 	}
++	cubeperf.End(ctx, "start-sandbox-client", stageStart)
+ 
++	stageStart = cubeperf.Now()
+ 	resp, err := svc.StartSandbox(ctx, &runtimeAPI.StartSandboxRequest{SandboxID: sandboxID})
+ 	if err != nil {
+ 		c.cleanupShim(ctx, sandboxID, svc)
+ 		return sandbox.ControllerInstance{}, fmt.Errorf("failed to start sandbox %s: %w", sandboxID, errgrpc.ToNative(err))
+ 	}
++	cubeperf.End(ctx, "shim-start-rpc", stageStart)
+ 	address, version := shim.Endpoint()
+ 	return sandbox.ControllerInstance{
+ 		SandboxID: sandboxID,
+new file mode 100644
+--- /dev/null
++++ b/internal/cri/config/sandbox_create_before_network_test.go
+@@ -0,0 +1,39 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package config
++
++import "testing"
++
++func TestValidateSandboxCreateBeforeNetwork(t *testing.T) {
++	for _, test := range []struct {
++		name      string
++		runtime   Runtime
++		wantError bool
++	}{
++		{name: "disabled podsandbox", runtime: Runtime{Sandboxer: string(ModePodSandbox)}},
++		{name: "disabled shim", runtime: Runtime{Sandboxer: string(ModeShim)}},
++		{name: "enabled shim", runtime: Runtime{Sandboxer: string(ModeShim), SandboxCreateBeforeNetwork: true}},
++		{name: "enabled podsandbox", runtime: Runtime{Sandboxer: string(ModePodSandbox), SandboxCreateBeforeNetwork: true}, wantError: true},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			err := validateSandboxCreateBeforeNetwork("test", test.runtime)
++			if (err != nil) != test.wantError {
++				t.Fatalf("error=%v wantError=%t", err, test.wantError)
++			}
++		})
++	}
++}
+new file mode 100644
+--- /dev/null
++++ b/internal/cri/server/sandbox_create_before_network_test.go
+@@ -0,0 +1,241 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package server
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	sb "github.com/containerd/containerd/v2/core/sandbox"
++)
++
++func TestCreateSandboxWhileSettingUpNetworkOverlapsAndWaitsForBoth(t *testing.T) {
++	setupEntered := make(chan struct{})
++	createEntered := make(chan struct{})
++	var shutdowns atomic.Int32
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++
++	network, createErr, shutdownErr := createSandboxWhileSettingUpNetwork(
++		ctx,
++		func(ctx context.Context) error {
++			close(setupEntered)
++			select {
++			case <-createEntered:
++				return nil
++			case <-ctx.Done():
++				return ctx.Err()
++			}
++		},
++		func() error {
++			select {
++			case <-setupEntered:
++			case <-ctx.Done():
++				return ctx.Err()
++			}
++			close(createEntered)
++			return nil
++		},
++		func() error {
++			shutdowns.Add(1)
++			return nil
++		},
++	)
++	if network.err != nil || createErr != nil || shutdownErr != nil {
++		t.Fatalf("network=%v create=%v shutdown=%v", network.err, createErr, shutdownErr)
++	}
++	if shutdowns.Load() != 0 {
++		t.Fatalf("shutdowns=%d", shutdowns.Load())
++	}
++}
++
++func TestCreateSandboxWhileSettingUpNetworkCancelsNetworkAfterCreateFailure(t *testing.T) {
++	createFailure := errors.New("create failed")
++	setupEntered := make(chan struct{})
++	var shutdowns atomic.Int32
++	network, createErr, shutdownErr := createSandboxWhileSettingUpNetwork(
++		context.Background(),
++		func(ctx context.Context) error {
++			close(setupEntered)
++			<-ctx.Done()
++			return ctx.Err()
++		},
++		func() error {
++			<-setupEntered
++			return createFailure
++		},
++		func() error {
++			shutdowns.Add(1)
++			return nil
++		},
++	)
++	if !errors.Is(createErr, createFailure) || !errors.Is(network.err, context.Canceled) || shutdownErr != nil {
++		t.Fatalf("network=%v create=%v shutdown=%v", network.err, createErr, shutdownErr)
++	}
++	if !network.canceledByCreateFailure {
++		t.Fatal("network cancellation was not attributed to create failure")
++	}
++	if shutdowns.Load() != 0 {
++		t.Fatalf("shutdowns=%d, want 0", shutdowns.Load())
++	}
++}
++
++func TestSandboxCreateNetworkErrorKeepsCreateFailureAsPrimaryAfterInducedCancellation(t *testing.T) {
++	createFailure := errors.New("create failed")
++	err := sandboxCreateNetworkError("sandbox-1", sandboxNetworkSetupResult{
++		err:                     context.Canceled,
++		canceledByCreateFailure: true,
++	}, createFailure)
++	if !errors.Is(err, createFailure) {
++		t.Fatalf("error does not retain create failure: %v", err)
++	}
++	if errors.Is(err, context.Canceled) {
++		t.Fatalf("induced cancellation leaked into primary error chain: %v", err)
++	}
++}
++
++func TestSandboxCreateNetworkErrorRetainsIndependentDualFailures(t *testing.T) {
++	createFailure := errors.New("create failed")
++	networkFailure := errors.New("network failed")
++	err := sandboxCreateNetworkError("sandbox-1", sandboxNetworkSetupResult{
++		err:                     networkFailure,
++		canceledByCreateFailure: true,
++	}, createFailure)
++	if !errors.Is(err, createFailure) || !errors.Is(err, networkFailure) {
++		t.Fatalf("error does not retain both failures: %v", err)
++	}
++}
++
++func TestCreateSandboxWhileSettingUpNetworkShutsDownCreatedSandboxOnNetworkFailure(t *testing.T) {
++	networkFailure := errors.New("network failed")
++	createEntered := make(chan struct{})
++	var shutdowns atomic.Int32
++	network, createErr, shutdownErr := createSandboxWhileSettingUpNetwork(
++		context.Background(),
++		func(context.Context) error {
++			<-createEntered
++			return networkFailure
++		},
++		func() error {
++			close(createEntered)
++			return nil
++		},
++		func() error {
++			shutdowns.Add(1)
++			return nil
++		},
++	)
++	if !errors.Is(network.err, networkFailure) || createErr != nil || shutdownErr != nil {
++		t.Fatalf("network=%v create=%v shutdown=%v", network.err, createErr, shutdownErr)
++	}
++	if shutdowns.Load() != 1 {
++		t.Fatalf("shutdowns=%d, want 1", shutdowns.Load())
++	}
++}
++
++func TestCreateSandboxWhileSettingUpNetworkReturnsShutdownFailure(t *testing.T) {
++	networkFailure := errors.New("network failed")
++	shutdownFailure := errors.New("shutdown failed")
++	network, createErr, shutdownErr := createSandboxWhileSettingUpNetwork(
++		context.Background(),
++		func(context.Context) error { return networkFailure },
++		func() error { return nil },
++		func() error { return shutdownFailure },
++	)
++	if !errors.Is(network.err, networkFailure) || createErr != nil || !errors.Is(shutdownErr, shutdownFailure) {
++		t.Fatalf("network=%v create=%v shutdown=%v", network.err, createErr, shutdownErr)
++	}
++}
++
++func TestStartCreatedSandboxRollsBackEveryPreStartFailure(t *testing.T) {
++	failure := errors.New("injected pre-start failure")
++	for _, test := range []struct {
++		name      string
++		failAt    string
++		wantCalls []string
++	}{
++		{name: "persist network", failAt: "persist", wantCalls: []string{"persist", "shutdown"}},
++		{name: "ensure pause", failAt: "pause", wantCalls: []string{"persist", "pause", "shutdown"}},
++		{name: "start sandbox", failAt: "start", wantCalls: []string{"persist", "pause", "start", "shutdown"}},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			var calls []string
++			step := func(name string) error {
++				calls = append(calls, name)
++				if test.failAt == name {
++					return failure
++				}
++				return nil
++			}
++			_, cleanupErr, err := startCreatedSandboxWithRollback(
++				func() error { return step("persist") },
++				func() error { return step("pause") },
++				func() (sb.ControllerInstance, error) {
++					return sb.ControllerInstance{}, step("start")
++				},
++				func() error { return step("shutdown") },
++			)
++			if !errors.Is(err, failure) || cleanupErr != nil {
++				t.Fatalf("error=%v cleanup=%v", err, cleanupErr)
++			}
++			if !reflect.DeepEqual(calls, test.wantCalls) {
++				t.Fatalf("calls=%v, want %v", calls, test.wantCalls)
++			}
++		})
++	}
++}
++
++func TestStartCreatedSandboxReportsRollbackFailure(t *testing.T) {
++	pauseFailure := errors.New("pause failed")
++	shutdownFailure := errors.New("shutdown failed")
++	_, cleanupErr, err := startCreatedSandboxWithRollback(
++		nil,
++		func() error { return pauseFailure },
++		func() (sb.ControllerInstance, error) {
++			t.Fatal("start called after pause failure")
++			return sb.ControllerInstance{}, nil
++		},
++		func() error { return shutdownFailure },
++	)
++	if !errors.Is(err, pauseFailure) || !errors.Is(cleanupErr, shutdownFailure) {
++		t.Fatalf("error=%v cleanup=%v", err, cleanupErr)
++	}
++}
++
++func TestStartCreatedSandboxTransfersOwnershipAfterStart(t *testing.T) {
++	var shutdowns atomic.Int32
++	want := sb.ControllerInstance{SandboxID: "sandbox-1"}
++	got, cleanupErr, err := startCreatedSandboxWithRollback(
++		nil,
++		func() error { return nil },
++		func() (sb.ControllerInstance, error) { return want, nil },
++		func() error {
++			shutdowns.Add(1)
++			return nil
++		},
++	)
++	if err != nil || cleanupErr != nil || got.SandboxID != want.SandboxID {
++		t.Fatalf("controller=%+v error=%v cleanup=%v", got, err, cleanupErr)
++	}
++	if shutdowns.Load() != 0 {
++		t.Fatalf("shutdowns=%d", shutdowns.Load())
++	}
++}
+new file mode 100644
+--- /dev/null
++++ b/pkg/cubeperf/clock_linux.go
 @@ -0,0 +1,27 @@
 +//go:build linux
 +
@@ -412,8 +1025,9 @@
 +	}
 +	return ts.Sec*1_000_000 + ts.Nsec/1_000
 +}
---- a/pkg/cubeperf/clock_other.go	1970-01-01 08:00:00.000000000 +0800
-+++ b/pkg/cubeperf/clock_other.go	2026-09-08 00:38:01.532458796 +0800
+new file mode 100644
+--- /dev/null
++++ b/pkg/cubeperf/clock_other.go
 @@ -0,0 +1,21 @@
 +//go:build !linux
 +
@@ -436,8 +1050,9 @@
 +func monotonicMicros() int64 {
 +	return 0
 +}
---- a/pkg/cubeperf/trace.go	1970-01-01 08:00:00.000000000 +0800
-+++ b/pkg/cubeperf/trace.go	2026-09-08 00:39:01.699300211 +0800
+new file mode 100644
+--- /dev/null
++++ b/pkg/cubeperf/trace.go
 @@ -0,0 +1,104 @@
 +// Copyright The containerd Authors.
 +//
@@ -543,98 +1158,3 @@
 +		phase, op.sandboxID, op.podUID, now, now-started,
 +	)
 +}
---- a/plugins/sandbox/controller.go	2026-08-30 19:48:02.255730251 +0800
-+++ b/plugins/sandbox/controller.go	2026-09-08 00:38:56.949312731 +0800
-@@ -39,6 +39,7 @@
- 	"github.com/containerd/containerd/v2/core/runtime"
- 	v2 "github.com/containerd/containerd/v2/core/runtime/v2"
- 	"github.com/containerd/containerd/v2/core/sandbox"
-+	"github.com/containerd/containerd/v2/pkg/cubeperf"
- 	"github.com/containerd/containerd/v2/plugins"
- )
- 
-@@ -123,24 +124,30 @@
- func (c *controllerLocal) Create(ctx context.Context, info sandbox.Sandbox, opts ...sandbox.CreateOpt) (retErr error) {
- 	var coptions sandbox.CreateOptions
- 	sandboxID := info.ID
-+	cubeperf.Point(ctx, "controller-create-begin")
- 	for _, opt := range opts {
- 		opt(&coptions)
- 	}
- 
-+	stageStart := cubeperf.Now()
- 	if _, err := c.shims.Get(ctx, sandboxID); err == nil {
- 		return fmt.Errorf("sandbox %s already running: %w", sandboxID, errdefs.ErrAlreadyExists)
- 	}
-+	cubeperf.End(ctx, "shim-cache-probe", stageStart)
- 
-+	stageStart = cubeperf.Now()
- 	bundle, err := v2.NewBundle(ctx, c.root, c.state, sandboxID, info.Spec)
- 	if err != nil {
- 		return err
- 	}
-+	cubeperf.End(ctx, "bundle-create", stageStart)
- 	defer func() {
- 		if retErr != nil {
- 			bundle.Delete()
- 		}
- 	}()
- 
-+	stageStart = cubeperf.Now()
- 	shim, err := c.shims.Start(ctx, sandboxID, bundle, runtime.CreateOpts{
- 		Spec:           info.Spec,
- 		RuntimeOptions: info.Runtime.Options,
-@@ -150,12 +157,16 @@
- 	if err != nil {
- 		return fmt.Errorf("failed to start new shim for sandbox %s: %w", sandboxID, err)
- 	}
-+	cubeperf.End(ctx, "shim-manager-start", stageStart)
- 
-+	stageStart = cubeperf.Now()
- 	svc, err := sandbox.NewClient(shim.Client())
- 	if err != nil {
- 		return err
- 	}
-+	cubeperf.End(ctx, "sandbox-client", stageStart)
- 
-+	stageStart = cubeperf.Now()
- 	if _, err := svc.CreateSandbox(ctx, &runtimeAPI.CreateSandboxRequest{
- 		SandboxID:   sandboxID,
- 		BundlePath:  shim.Bundle(),
-@@ -167,26 +178,35 @@
- 		c.cleanupShim(ctx, sandboxID, svc)
- 		return fmt.Errorf("failed to create sandbox %s: %w", sandboxID, errgrpc.ToNative(err))
- 	}
-+	cubeperf.End(ctx, "shim-create-rpc", stageStart)
-+	cubeperf.Point(ctx, "controller-create-complete")
- 
- 	return nil
- }
- 
- func (c *controllerLocal) Start(ctx context.Context, sandboxID string) (sandbox.ControllerInstance, error) {
-+	cubeperf.Point(ctx, "controller-start-begin")
-+	stageStart := cubeperf.Now()
- 	shim, err := c.shims.Get(ctx, sandboxID)
- 	if err != nil {
- 		return sandbox.ControllerInstance{}, fmt.Errorf("unable to find sandbox %q", sandboxID)
- 	}
-+	cubeperf.End(ctx, "start-shim-cache-get", stageStart)
- 
-+	stageStart = cubeperf.Now()
- 	svc, err := sandbox.NewClient(shim.Client())
- 	if err != nil {
- 		return sandbox.ControllerInstance{}, err
- 	}
-+	cubeperf.End(ctx, "start-sandbox-client", stageStart)
- 
-+	stageStart = cubeperf.Now()
- 	resp, err := svc.StartSandbox(ctx, &runtimeAPI.StartSandboxRequest{SandboxID: sandboxID})
- 	if err != nil {
- 		c.cleanupShim(ctx, sandboxID, svc)
- 		return sandbox.ControllerInstance{}, fmt.Errorf("failed to start sandbox %s: %w", sandboxID, errgrpc.ToNative(err))
- 	}
-+	cubeperf.End(ctx, "shim-start-rpc", stageStart)
- 	address, version := shim.Endpoint()
- 	return sandbox.ControllerInstance{
- 		SandboxID: sandboxID,
-

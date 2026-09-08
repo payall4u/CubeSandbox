@@ -28,6 +28,8 @@ const (
 	commandBackend            = "command"
 	tcPriority                = uint16(49152)
 	dumpRetryLimit            = 4
+	cniReadyTimeout           = 2 * time.Second
+	cniReadyPollInterval      = 2 * time.Millisecond
 	tapDeleteRetryLimit       = 3
 	tapDeleteRetryInterval    = time.Millisecond
 	neighborResolutionTimeout = 20 * time.Millisecond
@@ -165,15 +167,21 @@ func (n *netlinkNetwork) prepare(ctx context.Context, handle netlinkHandle, inte
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	cniLink, err := handle.LinkByName(interfaceName)
+	waitStarted := time.Now()
+	cniLink, ips, routes, gateways, err := waitForCNIConfiguration(ctx, handle, interfaceName)
+	trace := monotime.TraceBufferFromContext(ctx)
+	identity := startupTraceIdentityFromContext(ctx)
+	if trace.Enabled() {
+		trace.Addf(
+			"cube_perf component=cubelet operation=create phase=cni-ready-wait backend=netlink sandbox_id=%s pod_uid=%s operation_id=%s interface=%s ts_mono_us=%d duration_us=%d success=%t",
+			identity.sandboxID, identity.podUID, identity.operationID, interfaceName, monotime.Micros(), time.Since(waitStarted).Microseconds(), err == nil,
+		)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("find CNI interface %q: %w", interfaceName, err)
+		return nil, err
 	}
 	mac := cniLink.Attrs().HardwareAddr.String()
 	mtu := cniLink.Attrs().MTU
-	if mac == "" || mtu <= 0 {
-		return nil, errors.New("CNI interface must contain a MAC address and positive MTU")
-	}
 	tap, err := ensureNetlinkTap(ctx, handle, tapName)
 	if err != nil {
 		return nil, err
@@ -183,14 +191,6 @@ func (n *netlinkNetwork) prepare(ctx context.Context, handle netlinkHandle, inte
 	}
 	if err := handle.LinkSetUp(tap); err != nil {
 		return nil, fmt.Errorf("set TAP %q up: %w", tapName, err)
-	}
-	ips, err := netlinkAddresses(ctx, handle, cniLink)
-	if err != nil {
-		return nil, err
-	}
-	routes, gateways, err := netlinkRoutes(ctx, handle, cniLink, ips)
-	if err != nil {
-		return nil, err
 	}
 	neighbors, err := n.netlinkNeighbors(ctx, handle, cniLink, interfaceName, gateways)
 	if err != nil {
@@ -216,6 +216,66 @@ func (n *netlinkNetwork) prepare(ctx context.Context, handle netlinkHandle, inte
 		TapName: tapName, GuestInterfaceName: "eth0", Mac: mac, Mtu: uint32(mtu),
 		Ips: ips, Routes: routes, Neighbors: neighbors,
 	}, nil
+}
+
+func waitForCNIConfiguration(ctx context.Context, handle netlinkHandle, interfaceName string) (netlink.Link, []string, []*runtimev1.Route, []string, error) {
+	deadline := time.Now().Add(cniReadyTimeout)
+	var lastPending error
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, nil, err
+		}
+		link, err := handle.LinkByName(interfaceName)
+		switch {
+		case isLinkNotFound(err):
+			lastPending = fmt.Errorf("find CNI interface %q: %w", interfaceName, err)
+		case err != nil:
+			return nil, nil, nil, nil, fmt.Errorf("find CNI interface %q: %w", interfaceName, err)
+		case link.Attrs().HardwareAddr.String() == "" || link.Attrs().MTU <= 0:
+			lastPending = errors.New("CNI interface must contain a MAC address and positive MTU")
+		default:
+			ips, addressErr := netlinkAddresses(ctx, handle, link)
+			if addressErr == nil {
+				routes, gateways, routeErr := netlinkRoutes(ctx, handle, link, ips)
+				if routeErr == nil {
+					return link, ips, routes, gateways, nil
+				}
+				if !cniConfigurationPending(routeErr) {
+					return nil, nil, nil, nil, routeErr
+				}
+				lastPending = routeErr
+			} else {
+				if !cniConfigurationPending(addressErr) {
+					return nil, nil, nil, nil, addressErr
+				}
+				lastPending = addressErr
+			}
+		}
+
+		if !time.Now().Before(deadline) {
+			return nil, nil, nil, nil, fmt.Errorf("wait for CNI interface %q configuration: %w", interfaceName, lastPending)
+		}
+		wait := cniReadyPollInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+func cniConfigurationPending(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return message == "CNI interface has no global IP address" ||
+		strings.Contains(message, "CNI interface has no IPv4 default gateway") ||
+		strings.Contains(message, "CNI interface has no IPv6 default gateway") ||
+		message == "CNI interface has no default gateway"
 }
 
 func ensureNetlinkTap(ctx context.Context, handle netlinkHandle, tapName string) (netlink.Link, error) {
