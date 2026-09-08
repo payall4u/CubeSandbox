@@ -961,6 +961,11 @@ impl SandBox {
             .add_virtiofs(&self.conf.virtiofs)
             .add_vsock(self.id.clone());
 
+        if Utils::guest_boot_trace_enabled() {
+            let (serial_path, console_path) = Utils::prepare_guest_boot_trace(&self.id)?;
+            vc.enable_guest_boot_trace(serial_path, console_path);
+        }
+
         // Enable ivshmem device when the template build path sets the internal annotation.
         if self.is_ivshmem_enabled() {
             Self::enable_default_ivshmem(&mut vc, &self.id)

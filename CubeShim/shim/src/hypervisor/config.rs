@@ -183,14 +183,8 @@ impl VmConfig {
         vc.fs = self.fss.clone();
         vc.pmem = self.pmems.clone();
 
-        let console = ConsoleConfig {
-            mode: ConsoleOutputMode::Tty,
-            ..Default::default()
-        };
-
-        //fixd in cube
-        vc.serial = console.clone();
-        vc.console = console;
+        vc.serial = self.serial.clone();
+        vc.console = self.console.clone();
         vc.sys_ctrl = true;
         if let Some(vs) = self.vsock.clone() {
             vc.vsock = Some(vs)
@@ -272,6 +266,24 @@ impl VmConfig {
 
     pub fn set_kernel(&mut self, kernel: String) -> &mut Self {
         self.kernel = kernel;
+        self
+    }
+
+    pub fn enable_guest_boot_trace(
+        &mut self,
+        serial_path: PathBuf,
+        console_path: PathBuf,
+    ) -> &mut Self {
+        self.serial = ConsoleConfig {
+            file: Some(serial_path),
+            mode: ConsoleOutputMode::File,
+            ..Default::default()
+        };
+        self.console = ConsoleConfig {
+            file: Some(console_path),
+            mode: ConsoleOutputMode::File,
+            ..Default::default()
+        };
         self
     }
 
@@ -540,6 +552,21 @@ mod tests {
         assert_eq!(pmems[0].id.as_deref(), Some(HYP_OS_IMAGE_ID));
         assert_eq!(pmems[1].file, PathBuf::from("/agent.ext4"));
         assert_eq!(pmems[1].id.as_deref(), Some(HYP_AGENT_ID));
+    }
+
+    #[test]
+    fn guest_boot_trace_console_settings_survive_conversion() {
+        let mut config = VmConfig::default();
+        let serial_path = PathBuf::from("/tmp/sandbox.serial.log");
+        let console_path = PathBuf::from("/tmp/sandbox.console.log");
+
+        config.enable_guest_boot_trace(serial_path.clone(), console_path.clone());
+        let hypervisor_config = config.to_vm_config();
+
+        assert_eq!(hypervisor_config.serial.mode, ConsoleOutputMode::File);
+        assert_eq!(hypervisor_config.serial.file, Some(serial_path));
+        assert_eq!(hypervisor_config.console.mode, ConsoleOutputMode::File);
+        assert_eq!(hypervisor_config.console.file, Some(console_path));
     }
 
     #[test]

@@ -51,6 +51,7 @@ const DEV_URANDOM: &str = "/dev/urandom";
 const PASSFD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PASSFD_ACK_MAX_LINE_LEN: usize = 64;
 const PERF_TRACE_PATH: &str = "/data/log/CubeShim/cube-perf.log";
+const GUEST_BOOT_TRACE_DIR: &str = "/data/log/CubeShim/guest-boot";
 static PERF_TRACE_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
 /// Reject OCI exec fields before `oci-spec` deserialization can discard them.
@@ -175,6 +176,36 @@ impl Utils {
     /// worker process, so no additional synchronization is needed.
     pub fn perf_trace_enabled() -> bool {
         std::env::var_os("CUBE_PERF_TRACE").is_some_and(|value| value == "1")
+    }
+
+    /// Return whether per-sandbox Guest serial/console capture is enabled.
+    ///
+    /// This diagnostic is opt-in because console capture is intended for
+    /// startup attribution, not for the normal runtime data path.
+    pub fn guest_boot_trace_enabled() -> bool {
+        std::env::var_os("CUBE_GUEST_BOOT_TRACE").is_some_and(|value| value == "1")
+    }
+
+    /// Create the fixed trace directory and return sandbox-isolated output
+    /// paths for the legacy serial port and virtio console.
+    pub fn prepare_guest_boot_trace(sandbox_id: &str) -> CResult<(PathBuf, PathBuf)> {
+        let paths = Self::guest_boot_trace_paths(sandbox_id)?;
+        fs::create_dir_all(GUEST_BOOT_TRACE_DIR).map_err(|error| {
+            format!(
+                "create Guest boot trace directory {}: {}",
+                GUEST_BOOT_TRACE_DIR, error
+            )
+        })?;
+        Ok(paths)
+    }
+
+    fn guest_boot_trace_paths(sandbox_id: &str) -> CResult<(PathBuf, PathBuf)> {
+        Self::validate_sandbox_id(sandbox_id)?;
+        let base = PathBuf::from(GUEST_BOOT_TRACE_DIR);
+        Ok((
+            base.join(format!("{sandbox_id}.serial.log")),
+            base.join(format!("{sandbox_id}.console.log")),
+        ))
     }
 
     /// Append one structured performance trace without touching the shim
@@ -1357,6 +1388,24 @@ mod tests {
             result.unwrap(),
             PathBuf::from(format!("/dev/shm/ivshmem-{}", "a".repeat(128)))
         );
+    }
+
+    #[test]
+    fn guest_boot_trace_paths_are_sandbox_isolated() {
+        let (serial, console) = Utils::guest_boot_trace_paths("sandbox-123").unwrap();
+        assert_eq!(
+            serial,
+            PathBuf::from("/data/log/CubeShim/guest-boot/sandbox-123.serial.log")
+        );
+        assert_eq!(
+            console,
+            PathBuf::from("/data/log/CubeShim/guest-boot/sandbox-123.console.log")
+        );
+    }
+
+    #[test]
+    fn guest_boot_trace_paths_reject_traversal() {
+        assert!(Utils::guest_boot_trace_paths("../sandbox").is_err());
     }
 
     #[test]

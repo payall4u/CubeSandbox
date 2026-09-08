@@ -4,7 +4,9 @@
 
 S5.5d.2c-r1 首次正式跑数为 `FAIL`（reviewer P0/P1/P2=0/2/1），失败证据永久保留；
 S5.5d.3a-r2 已用完整 `52976d3b` 源码重建并由同一 reviewer `PASS`（P0/P1/P2=0/0/0）；
-当前进入 S5.5e Guest 冷启动与内存优化，d.3b network/VMM overlap 延后。
+当前进入 S5.5e Guest 冷启动与内存优化，d.3b network/VMM overlap 延后。S5.5e.1 已完成
+Guest/Host 精确归因和 20 Pod 内存基线，同一 reviewer 已终审 `PASS`（P0/P1/P2=0/0/0）；
+当前进入 S5.5e.2 Guest 内核确定性冷启动热点优化。
 S5.3、S5.3a、S5.3b、S5.3c、S5.4a～S5.4c 与 S5.5a～S5.5d.2b 均为 `DONE`。
 用户决定先优化普通 OCI 冷启动，目标是串行 PodScheduled→Ready P95≤1.5s 并消除并发放大；
 S5.5 完成后再进入 S6.1。不得回退已验收的普通 worker 启动路径。
@@ -147,8 +149,10 @@ RunPodSandbox 重试、round spread=11.184s。Ready P95 为 1.714/2.255s。revie
 
 GLM 的冻结分支全量 Node E2E 是独立并行验证，不占用主线 Stage，也不阻塞 S5.5；只有绑定
 commit/artifact SHA 且原始结果可复验后才接收入回归证据。GLM 当前使用的 W1 可处于
-NotReady，主线不得恢复或修改 W1。当前明确卡点是 delayed gateway neighbor 的首次 CRI
-可靠性，以及“network prepare 完成后才启动 VMM”的顺序导致并发 CRI→VMM 无法满足 300ms。
+NotReady，主线不得恢复或修改 W1。delayed gateway neighbor 的首次 CRI 可靠性已关闭。
+当前没有环境阻断；确定性性能热点是 Guest 内核启用 `CONFIG_RAID6_PQ_BENCHMARK=y`，每次
+cold boot 执行约 476ms 的 RAID6 算法自测。network prepare 完成后才启动 VMM 仍是并发
+性能债务，但已按用户决定延后。
 
 ## 受保护路径
 
@@ -159,12 +163,12 @@ assets 和回滚副本；不得在仓库或 handoff 中记录凭证、token、�
 
 ## 下一步
 
-1. S5.5d.3a 用 context-bounded probe/poll 修复 delayed gateway neighbor，完成 10 并发无 retry、
-   永久缺失超时回滚、exact-zero，并取得同一 reviewer PASS。
-2. S5.5d.3b 让 VMM preboot 与 network async finalize/attach 重叠；StartSandbox 返回前 join
-   VMM-ready 与 network-committed，任一分支失败须取消另一分支并可恢复清零。
-3. S5.5d.3c 在同一新 commit/artifact/analyzer 上重跑完整 50 串行与 5×10 并发及功能/故障回归。
-4. S5.5f 达到串行 P95≤1.5s、并发 P95≤1.8s，并完成受影响 Node E2E 回归；完整方案见
+1. S5.5e.1 经同一 reviewer 终审后，S5.5e.2 关闭 Guest RAID6 benchmark 等确定性冷启动
+   热点并完成 50 次串行与能力回归。
+2. S5.5e.3 缩减 Guest 内核无关常驻 code/rodata/tracing 元数据，达到 20 Pod
+   `memory.current≤100MiB/Pod` 并完成能力回归。
+3. S5.5f 达到串行 P95≤1.5s、并发 P95≤1.8s，并完成受影响 Node E2E 回归；若并发仍受
+   network→VMM 顺序阻塞，再恢复 S5.5d.3b/c。完整方案见
    [S5.5 性能优化方案](../../zh/dev/kubernetes-runtime-performance-s5.5.md)。
-5. S5.5 后进入 S6.1；按 S6.2a 恢复链路、S6.2b 动态身份、S6.2c 性能/密度/overhead 顺序
+4. S5.5 后进入 S6.1；按 S6.2a 恢复链路、S6.2b 动态身份、S6.2c 性能/密度/overhead 顺序
    完成 RuntimeTemplate 和 S5.4d 一秒门禁，再进入 S6.3 PodSnapshot。
