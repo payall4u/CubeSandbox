@@ -160,30 +160,49 @@ S5.5c 实测进一步证明网络 backend 的直接耗时已经达标，但原�
 - 失败回滚后 TAP、qdisc/filter、netns FD 和 lease 全部归零。
 
 `CRI receive→start vm` 在本阶段作为非阻断累计 checkpoint 报告；若超过串行 300ms/并发
-450ms，必须带非重叠分段转交 S5.5d.1/S5.5d.2，不能扩大 S5.5c 的实现边界。
+450ms，必须带不重复计费的偏序分段转交 S5.5d.1/S5.5d.2，不能扩大 S5.5c 的实现边界。
 
 ### S5.5d.1：CRI/CNI dispatch 与 Shim 连接前快路径
 
-目标：先建立无重叠时间线，再消除 `RunPodSandbox` 接收至 CubeShim create 开始前的排队、
+目标：先建立允许 CNI/controller 并行的偏序时间线，再消除 `RunPodSandbox` 接收至 CubeShim create 开始前的排队、
 重复配置发现和非必要进程/IPC；不在本子阶段修改 durable journal 或 Host cgroup 状态机。
 
 工作项：
 
 - 补齐同一时钟域的 CRI receive、CNI begin/end、shim resolve/spawn/connect 和 Shim create begin
-  事件，逐项相减，不再把重叠区间相加成“上界”。
+  事件；分别验证 CNI 链与 controller 链的单调性，显式计算重叠，不再把并行区间相加成“上界”。
 - 修正性能 runner：新 run 启动时截断 append-only manifest/output，结果中写入真实分位数算法，
   并在验收前断言 manifest、Pod UID、sandbox ID 的期望数和唯一数，禁止复用目录污染样本。
 - 区分 containerd CRI 排队、CNI、shim manager 查找/连接和新 Shim 拉起；只优化 Cube 可控且有
   实测占比的步骤。
-- 保持 RuntimeClass handler、CNI 调用顺序、sandbox ownership 和 containerd shim v2 契约不变。
+- 保持 RuntimeClass handler、sandbox ownership 和 containerd shim v2 契约不变。若实测 CNI 是冻结
+  绝对门禁的主因，可为 external shim sandboxer 增加默认关闭的 opt-in：先 dispatch CNI，再并行
+  `CreateSandbox`，但必须等二者都成功后才 `StartSandbox`，并完整处理任一分支失败的取消/回滚；
+  runc 和其他未开启 runtime 的既有顺序不得改变。
+
+本阶段同时保留两条口径：`CRI receive→Shim create begin` 是冻结硬门禁；顺序路径的
+`Cube-controlled pre-Shim` 可扣除同一 Pod、同一单调时钟上与 controller 相邻的 CNI ADD，
+只用于内部归因。并行路径不能再次扣除已经重叠的 CNI 时间，此时诊断值等于绝对值。不得扣除
+CRI 排队、containerd dispatch、Shim resolve/spawn/connect，也不得用限并发或删样本降低分位数。
+S5.5f 仍以完整
+`PodScheduled→Ready` 验收，CNI 不从任何最终 SLO 中排除。
 
 验收：
 
-- 50 串行和 5×10 并发样本均能一一绑定 Pod UID、sandbox ID、Shim PID 和 worker PID，时间段
-  无重叠、无负数、总和与端到端残差有解释。
-- `CRI receive→Shim create begin` 串行 P95≤80ms、10 并发 P95≤150ms；成功率 100%。
+- 50 串行和 5×10 并发样本均能一一绑定 Pod UID、sandbox ID、Shim PID 和 worker PID；CNI 与
+  controller 两条链各自单调，重叠量显式记录，controller 关键路径总和与绝对 pre-Shim 残差为 0。
+- 绝对 `CRI receive→Shim create begin` 串行 P95≤80ms、10 并发 P95≤150ms；成功率 100%；
+  Cube-controlled 数值只做根因定位。
 - DNS、ClusterIP、跨节点 PodIP、NetworkPolicy、创建中取消、containerd restart 和 exact-zero
   无回退。
+
+修复版 `overlap-v2` 首次正式 50+50 结果为串行/并发绝对 pre-Shim
+P95=75.812/147.511ms，均通过≤80/150ms；Ready P95=1833.551/2297.276ms，继续转交
+S5.5d.2/e/f。早期 `overlap-v1` 因 duration 结束点和 Create 后、Start 前回滚缺口全部作废。
+同一 reviewer 终审 `PASS`（P0/P1/P2=0），实现 commit 为
+`8129b3a9451b21f496f75d3faa8d8ca72ff3b265`。
+完整原始证据和失败回滚语义见
+[S5.5d.1 阶段证据](../../handoffs/kubernetes-runtime/evidence/s5.5/s5.5d.1-pre-shim-fastpath.md)。
 
 ### S5.5d.2：durable create、持久化与 Host cgroup 快路径
 

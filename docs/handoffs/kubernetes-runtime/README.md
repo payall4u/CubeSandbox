@@ -2,19 +2,17 @@
 
 ## 当前 Stage
 
-S5.5c `DONE`，独立 reviewer 终审 `PASS`（P0/P1/P2=0）；S5.5d.1 `IN_PROGRESS`。
-S5.3、S5.3a、S5.3b、S5.3c、S5.4a～S5.4c 与 S5.5a～S5.5c 均为 `DONE`。
+S5.5d.1 `DONE`，同一 reviewer 终审 `PASS`（P0/P1/P2=0）；S5.5d.2 `IN_PROGRESS`。
+S5.3、S5.3a、S5.3b、S5.3c、S5.4a～S5.4c 与 S5.5a～S5.5d.1 均为 `DONE`。
 用户决定先优化普通 OCI 冷启动，目标是串行 PodScheduled→Ready P95≤1.5s 并消除并发放大；
 S5.5 完成后再进入 S6.1。不得回退已验收的普通 worker 启动路径。
 
 ## 基线
 
-当前 S5.5c 实现 commit 为 `69b3f9b1503566171bb4a03cef56f0447a80b346`，真实内核回滚测试
-commit 为 `adc416d2`，tree 为
-`0cdedb2b10aeebf6f49e785f446d6edd363b5d4e`。W2 已部署候选 RuntimeResource；Host
-CubeShim/worker/runtime 的最终 digest 必须在 S5.5c 证据包中重新冻结。上一已验收基线为：
-Shim SHA-256 `4bcc5d53…`、worker `5b0b0d9f…`、RuntimeResource harness `68233e1d…`；
-Agent ext4 为 `3c36bcb9…`。`RuntimeClass/cube` 保留。W1 由 GLM 独立使用，主线未触碰。
+当前最后已提交实现为 `8129b3a9451b21f496f75d3faa8d8ca72ff3b265`；S5.5d.1 修复版
+`overlap-v2` 已完成。W2 已部署 containerd
+`59a92496…` 与 RuntimeResource `bd52076f…`；CubeShim/worker 沿用 `3fd76d04…`/
+`bff4e979…`。`RuntimeClass/cube` 保留。W1 由 GLM 独立使用，主线未触碰。
 
 ## 已完成
 
@@ -57,10 +55,19 @@ RuntimeResource restart 和清理已经通过。累计 CRI→start-vm P95 仍为
 runner/源码的三份可反向校验 v6 证据包均已完成；独立 reviewer 终审 `PASS`
 （P0/P1/P2=0），状态为 `DONE`。完整结果见 [S5.5c 最终证据](./evidence/s5.5/s5.5c-netlink-fastpath.md)。
 
+S5.5d.1 修复版候选已把 external shim sandboxer 的 CNI ADD 与 `CreateSandbox` 改为默认关闭、
+仅 Cube 开启的并行准备，`StartSandbox` 仍等待两者成功；任一分支失败均有取消/回滚。Cubelet
+在 Pod netns 等待 CNI 地址/路由再建立 TAP。首次正式串行/5×10 各 50/50 成功，绝对
+pre-Shim P95 为 75.812/147.511ms，达到≤80/150ms；Ready P95 为
+1833.551/2297.276ms。网络、跨节点、containerd restart、严格 10/10 Pending 创建取消和双节点
+exact-zero 均通过；同一 reviewer 终审 `PASS`（P0/P1/P2=0）。早期 `overlap-v1` 因 duration
+结束点和回滚缺口已全部作废，不构成验收。详见
+[S5.5d.1 证据](./evidence/s5.5/s5.5d.1-pre-shim-fastpath.md)。
+
 ## 未完成
 
-- S5.5d.1、S5.5d.2、S5.5e～S5.5f：普通冷启动性能优化；退出门禁为串行 P95≤1.5s、5×10 并发 P95≤1.8s，
-  冲刺并发 P95≤1.5s。
+- S5.5d.2、S5.5e～S5.5f 普通冷启动性能优化。最终退出门禁为串行
+  P95≤1.5s、5×10 并发 P95≤1.8s，冲刺并发 P95≤1.5s。
 - S6.1、S6.2a～c、S6.3～S6.4：模板、快照与暂停恢复设计和实现；S6.2c 负责模板路径密度和
   RuntimeClass overhead 最终标定。
 - S4.1～S4.3：状态重连、Reconcile 与可观测性，权威计划中仍为 `NOT_STARTED`。
@@ -87,13 +94,18 @@ runner/源码的三份可反向校验 v6 证据包均已完成；独立 reviewer
   reviewer `PASS`（P0/P1/P2=0）。
 - S5.5c 三份 v6 包的外层/内层 checksum、credential scan、command/netlink 往返、restart、
   双节点 exact-zero 均通过；独立 reviewer `PASS`（P0/P1/P2=0）。
-- `git diff --check`、credential scan、`make handoff-validate` 与 reviewer 终审均通过。
+- S5.5d.1 修复版正式串行/并发分析为 `inv-a8dgrtgtav`/`inv-a8dgur0vux`，冻结门禁均通过；
+  W2/控制/W3 证据包 SHA-256 为 `3a5aa93f…`/`4d299303…`/`4dde7923…`，均通过源端
+  credential/内层 checksum、COS 反向下载、Builder 解包复验和本地逐字节分析复算；同一
+  reviewer 终审 `PASS`（P0/P1/P2=0）。
+- 实现 commit 为 `8129b3a9451b21f496f75d3faa8d8ca72ff3b265`；`git diff --check`、
+  credential scan、`make handoff-validate` 已通过。
 
 ## 阻塞
 
 GLM 的冻结分支全量 Node E2E 是独立并行验证，不占用主线 Stage，也不阻塞 S5.5；只有绑定
 commit/artifact SHA 且原始结果可复验后才接收入回归证据。GLM 当前使用的 W1 可处于
-NotReady，主线不得恢复或修改 W1。当前没有阻止 S5.5d.1 实现与 W2/W3 验证的明确卡点。
+NotReady，主线不得恢复或修改 W1。当前没有阻止 S5.5d.2 实现与 W2/W3 验证的明确卡点。
 
 ## 受保护路径
 
@@ -104,12 +116,10 @@ assets 和回滚副本；不得在仓库或 handoff 中记录凭证、token、�
 
 ## 下一步
 
-1. S5.5d.1 先修正 runner 的输出截断、唯一计数和分位数元数据，建立同钟域非重叠时间线，
-   再优化 CRI receive 至 Shim create begin；已达成的 network prepare 4.313/6.293ms 与 exec=0
-   不重复优化。
-2. 按 S5.5d.1、S5.5d.2、
-   S5.5e 依次关闭 pre-Shim/CRI-CNI dispatch、重复持久化/placement 等待和 Guest
-   cold boot；每个子阶段只在专项、故障与 exact-zero 通过后进入下一阶段。
+1. 执行 S5.5d.2；先从 S5.5d.1 的同钟域 trace 拆出 durable create、journal/fsync 和 Host cgroup
+   placement，再在不关闭 fsync/精确 readback 的前提下优化。
+2. 以 atomic persistence failpoint、worker/Shim kill、containerd/Cubelet restart 和 exact-zero
+   验证恢复语义；达到 Shim create→start-vm≤140/150ms、累计 CRI→VMM≤220/300ms。
 3. S5.5f 达到串行 P95≤1.5s、并发 P95≤1.8s，并完成受影响 Node E2E 回归；完整方案见
    [S5.5 性能优化方案](../../zh/dev/kubernetes-runtime-performance-s5.5.md)。
 4. S5.5 后进入 S6.1；按 S6.2a 恢复链路、S6.2b 动态身份、S6.2c 性能/密度/overhead 顺序

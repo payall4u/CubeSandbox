@@ -41,12 +41,29 @@ core sandbox 的 `updated-resources` extension 恢复 custom sandboxer 的当前
 当前 memory usage 和瞬时 CPU 等主要统计；需要单调 Pod 生命周期累计值时必须改为
 Guest Pod cgroup 原生指标，不能继续从当前容器集合合成。
 
-## trace 补丁
+## S5.5d.1 trace 与外部 Sandbox 并行创建补丁
 
 `containerd-v2.3.4-s34-trace.patch` 只用于 S3.4 诊断，不应进入运行时验收制品。
 
-`containerd-v2.3.4-s55d1-perf-trace.patch` 只用于 S5.5d.1 性能归因。它在
-`CUBE_PERF_TRACE=1` 且 CRI RuntimeHandler 为 `cube` 时，把 containerd
-RunPodSandbox、sandbox controller 和 Shim bootstrap 的 `CLOCK_MONOTONIC` 时间点写入
-containerd 日志；默认完全关闭。该补丁不属于生产制品，完成性能验收后必须恢复无埋点的
-containerd，并以同一 workload 重跑最终门禁。
+`containerd-v2.3.4-s55d1-perf-trace.patch` 是应用到固定 containerd v2.3.4 基线的
+累积 PoC 补丁，包含两部分：
+
+- 在 `CUBE_PERF_TRACE=1` 且 CRI RuntimeHandler 为 `cube` 时，把 RunPodSandbox、
+  sandbox controller 和 Shim bootstrap 的 `CLOCK_MONOTONIC` 时间点写入 containerd
+  日志；trace 默认关闭。
+- 为 external shim sandboxer 增加 opt-in 配置
+  `sandbox_create_before_network = true`。开启后，CRI 在创建 Pod netns 后并行执行 CNI
+  ADD 与 `CreateSandbox`，在二者都成功后才执行 `StartSandbox`。Create 失败会取消 CNI；
+  由该取消产生的 `context.Canceled` 不会掩盖 Create 主因，独立双失败保留两条错误链。
+  CNI 失败会回滚已创建的 Sandbox；Create 成功后的 network metadata persist、pause image
+  检查或 Start 失败也会同步 `ShutdownSandbox`，rollback 失败进入 containerd 的可重试
+  cleanup 状态。该选项只能与 `sandboxer = "shim"` 一起使用，默认关闭，因此不会改变
+  runc 或其他 runtime 的既有顺序。
+
+CNI 和 controller 的 duration 分别在各自回调返回时结束，不包含等待另一条并行链的 join
+时间；分析时必须同时保留两条偏序链，不能把重叠区间重复计费。
+
+Cubelet 的配套实现会在 Pod netns 内等待 CNI 写入接口地址和默认路由，再创建 TAP/tc；
+这使 Cube 初始化可与 CNI datapath 准备重叠，同时维持“网络就绪后才启动 Sandbox”的
+对外语义。当前补丁是版本固定的 PoC 集成点，不冒充 containerd 上游接口；长期应将
+通用的 external sandboxer 异步准备协议提交上游讨论，并把性能 trace 与功能改动拆开。
