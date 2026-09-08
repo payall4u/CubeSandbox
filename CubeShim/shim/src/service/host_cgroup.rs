@@ -30,6 +30,8 @@ use crate::service::bootstrap::BootstrapParams;
 use crate::service::runtime_resource::{self, HostResourceCeiling};
 
 const SCHEMA_VERSION: u32 = 2;
+const LEGACY_CONTROLLER_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const CONTROLLER_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_LIFECYCLE_ROOT: &str = "/data/cubelet/shim-lifecycle";
 const LIFECYCLE_ROOT_ENV: &str = "CUBE_SHIM_LIFECYCLE_ROOT";
 const LIFECYCLE_DIR_ENV: &str = "CUBE_SHIM_LIFECYCLE_DIR";
@@ -1912,9 +1914,9 @@ impl LifecycleHandle {
     }
 
     /// Apply or recover the static Host leaf transaction. The operation lock
-    /// serializes all external mutations, while every individual write is
-    /// preceded by a durable INTENT and a fresh epoch/identity check under the
-    /// record lock.
+    /// serializes all external mutations. A batch journal durably records all
+    /// old/target values before the first write, and every write still performs
+    /// a fresh epoch/identity check before touching the controller.
     pub(crate) fn apply_host_resource_ceiling(
         &self,
         ceiling: &HostResourceCeiling,
@@ -1956,27 +1958,13 @@ impl LifecycleHandle {
                     )?;
                 }
                 None => {
-                    let mut steps = Vec::with_capacity(targets.len());
-                    for (file, target_value) in &targets {
-                        steps.push(ControllerStep {
-                            file: (*file).to_string(),
-                            old: read_controller_value(&leaf, file)?,
-                            target: target_value.clone(),
-                            state: ControllerStepState::NotStarted,
-                            observed: None,
-                        });
-                    }
-                    preflight_controller_targets(&leaf, &steps)?;
-                    owner.controllers = Some(ControllerJournal {
-                        schema_version: 1,
-                        transaction_id: uuid::Uuid::new_v4().to_string(),
-                        owner_epoch: epoch,
-                        owner_identity: identity.clone(),
-                        create_fingerprint: fingerprint.clone(),
-                        state: ControllerTransactionState::Prepared,
-                        steps,
-                        degraded_reason: None,
-                    });
+                    owner.controllers = Some(prepare_controller_batch_journal(
+                        &leaf,
+                        &targets,
+                        epoch,
+                        &identity,
+                        &fingerprint,
+                    )?);
                     persist_host_owner_exact(&self.directory, &owner)?;
                 }
             }
@@ -2063,9 +2051,20 @@ impl LifecycleHandle {
                 .as_mut()
                 .ok_or_else(|| "Host controller journal disappeared before rollback".to_string())?;
             verify_controller_journal_owner(journal, epoch, identity, fingerprint)?;
-            if journal.state != ControllerTransactionState::Restored {
-                journal.state = ControllerTransactionState::RollingBack;
-                persist_host_owner_exact(&self.directory, &owner)?;
+            match journal.state {
+                ControllerTransactionState::Restored | ControllerTransactionState::RollingBack => {}
+                ControllerTransactionState::Degraded
+                | ControllerTransactionState::AbandonedForExactDelete => {
+                    return Err(format!(
+                        "Host controller rollback cannot start from {:?}: {}",
+                        journal.state,
+                        journal.degraded_reason.as_deref().unwrap_or("no reason")
+                    ));
+                }
+                _ => {
+                    journal.state = ControllerTransactionState::RollingBack;
+                    persist_host_owner_exact(&self.directory, &owner)?;
+                }
             }
         }
         replay_controller_rollback_with_failpoint(
@@ -2806,8 +2805,10 @@ fn verify_controller_journal_owner(
     identity: &ProcessIdentity,
     fingerprint: &str,
 ) -> Result<(), String> {
-    if journal.schema_version != 1
-        || journal.transaction_id.is_empty()
+    if !matches!(
+        journal.schema_version,
+        LEGACY_CONTROLLER_JOURNAL_SCHEMA_VERSION | CONTROLLER_JOURNAL_SCHEMA_VERSION
+    ) || journal.transaction_id.is_empty()
         || journal.owner_epoch != epoch
         || !immutable_identity_matches(&journal.owner_identity, identity)
         || journal.create_fingerprint != fingerprint
@@ -2820,6 +2821,14 @@ fn verify_controller_journal_owner(
         ])
     {
         return Err("Host controller journal identity or fixed step order changed".to_string());
+    }
+    if journal.schema_version == CONTROLLER_JOURNAL_SCHEMA_VERSION
+        && (journal.state == ControllerTransactionState::Applying
+            || journal.steps.iter().any(|step| {
+                step.state != ControllerStepState::NotStarted || step.observed.is_some()
+            }))
+    {
+        return Err("Host controller batch journal contains legacy step progress".to_string());
     }
     Ok(())
 }
@@ -2986,6 +2995,36 @@ fn preflight_controller_targets(leaf: &Path, steps: &[ControllerStep]) -> Result
     Ok(())
 }
 
+fn prepare_controller_batch_journal(
+    leaf: &Path,
+    targets: &[(&str, String); 4],
+    owner_epoch: u64,
+    owner_identity: &ProcessIdentity,
+    create_fingerprint: &str,
+) -> Result<ControllerJournal, String> {
+    let mut steps = Vec::with_capacity(targets.len());
+    for (file, target) in targets {
+        steps.push(ControllerStep {
+            file: (*file).to_string(),
+            old: read_controller_value(leaf, file)?,
+            target: target.clone(),
+            state: ControllerStepState::NotStarted,
+            observed: None,
+        });
+    }
+    preflight_controller_targets(leaf, &steps)?;
+    Ok(ControllerJournal {
+        schema_version: CONTROLLER_JOURNAL_SCHEMA_VERSION,
+        transaction_id: uuid::Uuid::new_v4().to_string(),
+        owner_epoch,
+        owner_identity: owner_identity.clone(),
+        create_fingerprint: create_fingerprint.to_string(),
+        state: ControllerTransactionState::Prepared,
+        steps,
+        degraded_reason: None,
+    })
+}
+
 fn exact_controller_readback(
     leaf: &Path,
     journal: &ControllerJournal,
@@ -3040,8 +3079,45 @@ where
     Verify: FnMut() -> Result<(), String>,
     Failpoint: FnMut(&str) -> Result<(), String>,
 {
+    match load()?.schema_version {
+        LEGACY_CONTROLLER_JOURNAL_SCHEMA_VERSION => replay_controller_forward_legacy_state(
+            leaf,
+            &mut load,
+            &mut persist,
+            &mut verify_claim,
+            &mut failpoint,
+        ),
+        CONTROLLER_JOURNAL_SCHEMA_VERSION => replay_controller_forward_batch_state(
+            leaf,
+            &mut load,
+            &mut persist,
+            &mut verify_claim,
+            &mut failpoint,
+        ),
+        version => Err(format!(
+            "unsupported Host controller journal schema {version}"
+        )),
+    }
+}
+
+fn replay_controller_forward_legacy_state<Load, Persist, Verify, Failpoint>(
+    leaf: &Path,
+    load: &mut Load,
+    persist: &mut Persist,
+    verify_claim: &mut Verify,
+    failpoint: &mut Failpoint,
+) -> Result<(), String>
+where
+    Load: FnMut() -> Result<ControllerJournal, String>,
+    Persist: FnMut(&ControllerJournal) -> Result<(), String>,
+    Verify: FnMut() -> Result<(), String>,
+    Failpoint: FnMut(&str) -> Result<(), String>,
+{
     loop {
         let mut journal = load()?;
+        if journal.schema_version != LEGACY_CONTROLLER_JOURNAL_SCHEMA_VERSION {
+            return Err("Host controller journal schema changed during legacy forward".to_string());
+        }
         if journal.state == ControllerTransactionState::ControllersCommitted {
             exact_controller_readback(leaf, &journal, true)?;
             return Ok(());
@@ -3142,6 +3218,108 @@ where
     }
 }
 
+fn replay_controller_forward_batch_state<Load, Persist, Verify, Failpoint>(
+    leaf: &Path,
+    load: &mut Load,
+    persist: &mut Persist,
+    verify_claim: &mut Verify,
+    failpoint: &mut Failpoint,
+) -> Result<(), String>
+where
+    Load: FnMut() -> Result<ControllerJournal, String>,
+    Persist: FnMut(&ControllerJournal) -> Result<(), String>,
+    Verify: FnMut() -> Result<(), String>,
+    Failpoint: FnMut(&str) -> Result<(), String>,
+{
+    let mut journal = load()?;
+    if journal.schema_version != CONTROLLER_JOURNAL_SCHEMA_VERSION {
+        return Err("Host controller journal schema changed during batch forward".to_string());
+    }
+    if journal.state == ControllerTransactionState::ControllersCommitted {
+        exact_controller_readback(leaf, &journal, true)?;
+        return Ok(());
+    }
+    if journal.state != ControllerTransactionState::Prepared {
+        return Err(format!(
+            "Host controller batch transaction cannot move forward from {:?}",
+            journal.state
+        ));
+    }
+
+    for index in 0..journal.steps.len() {
+        let file = journal.steps[index].file.clone();
+        let old = journal.steps[index].old.clone();
+        let target = journal.steps[index].target.clone();
+        let actual = read_controller_value(leaf, &file)?;
+        if actual != old && actual != target {
+            let reason = format!(
+                "controller {} is neither old {} nor target {}: {actual}",
+                file, old, target
+            );
+            mark_controller_degraded(&mut journal, &reason);
+            persist(&journal)?;
+            return Err(reason);
+        }
+        if actual == target {
+            continue;
+        }
+
+        failpoint(&format!("before-write-{file}"))?;
+        verify_claim()?;
+        // The ownership fence may block while another actor changes a
+        // controller. Re-read after the fence and immediately before the
+        // write so a newly observed third value is never guessed over.
+        let adjacent = read_controller_value(leaf, &file)?;
+        if adjacent != old && adjacent != target {
+            let reason = format!(
+                "controller {file} changed after owner fence and is neither old {old} nor target {target}: {adjacent}"
+            );
+            mark_controller_degraded(&mut journal, &reason);
+            persist(&journal)?;
+            return Err(reason);
+        }
+        if adjacent == target {
+            continue;
+        }
+        write_controller_value(leaf, &file, &target)?;
+        failpoint(&format!("after-write-{file}"))?;
+        failpoint(&format!("before-readback-{file}"))?;
+        let observed = read_controller_value(leaf, &file)?;
+        if observed != target {
+            if observed != old {
+                let reason = format!(
+                    "controller {} target readback is neither old {} nor target {}: {observed}",
+                    file, old, target
+                );
+                mark_controller_degraded(&mut journal, &reason);
+                persist(&journal)?;
+                return Err(reason);
+            }
+            return Err(format!(
+                "controller {} target readback mismatch: expected {}, found {observed}",
+                file, target
+            ));
+        }
+        failpoint(&format!("after-readback-{file}"))?;
+    }
+
+    failpoint("before-controllers-committed")?;
+    verify_claim()?;
+    let mut durable = load()?;
+    if durable.schema_version != CONTROLLER_JOURNAL_SCHEMA_VERSION
+        || durable.transaction_id != journal.transaction_id
+        || durable.state != ControllerTransactionState::Prepared
+    {
+        return Err("Host controller batch transaction changed before commit".to_string());
+    }
+    exact_controller_readback(leaf, &durable, true)?;
+    durable.state = ControllerTransactionState::ControllersCommitted;
+    persist(&durable)?;
+    failpoint("after-controllers-committed")?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn replay_controller_rollback<Load, Persist>(
     leaf: &Path,
     load: Load,
@@ -3167,8 +3345,47 @@ where
     Verify: FnMut() -> Result<(), String>,
     Failpoint: FnMut(&str) -> Result<(), String>,
 {
+    match load()?.schema_version {
+        LEGACY_CONTROLLER_JOURNAL_SCHEMA_VERSION => replay_controller_rollback_legacy_state(
+            leaf,
+            &mut load,
+            &mut persist,
+            &mut verify_claim,
+            &mut failpoint,
+        ),
+        CONTROLLER_JOURNAL_SCHEMA_VERSION => replay_controller_rollback_batch_state(
+            leaf,
+            &mut load,
+            &mut persist,
+            &mut verify_claim,
+            &mut failpoint,
+        ),
+        version => Err(format!(
+            "unsupported Host controller journal schema {version}"
+        )),
+    }
+}
+
+fn replay_controller_rollback_legacy_state<Load, Persist, Verify, Failpoint>(
+    leaf: &Path,
+    load: &mut Load,
+    persist: &mut Persist,
+    verify_claim: &mut Verify,
+    failpoint: &mut Failpoint,
+) -> Result<(), String>
+where
+    Load: FnMut() -> Result<ControllerJournal, String>,
+    Persist: FnMut(&ControllerJournal) -> Result<(), String>,
+    Verify: FnMut() -> Result<(), String>,
+    Failpoint: FnMut(&str) -> Result<(), String>,
+{
     loop {
         let mut journal = load()?;
+        if journal.schema_version != LEGACY_CONTROLLER_JOURNAL_SCHEMA_VERSION {
+            return Err(
+                "Host controller journal schema changed during legacy rollback".to_string(),
+            );
+        }
         if journal.state == ControllerTransactionState::Restored {
             exact_controller_readback(leaf, &journal, false)?;
             return Ok(());
@@ -3261,6 +3478,122 @@ where
             ControllerStepState::Restored => {}
         }
     }
+}
+
+fn replay_controller_rollback_batch_state<Load, Persist, Verify, Failpoint>(
+    leaf: &Path,
+    load: &mut Load,
+    persist: &mut Persist,
+    verify_claim: &mut Verify,
+    failpoint: &mut Failpoint,
+) -> Result<(), String>
+where
+    Load: FnMut() -> Result<ControllerJournal, String>,
+    Persist: FnMut(&ControllerJournal) -> Result<(), String>,
+    Verify: FnMut() -> Result<(), String>,
+    Failpoint: FnMut(&str) -> Result<(), String>,
+{
+    let mut journal = load()?;
+    if journal.schema_version != CONTROLLER_JOURNAL_SCHEMA_VERSION {
+        return Err("Host controller journal schema changed during batch rollback".to_string());
+    }
+    if journal.state == ControllerTransactionState::Restored {
+        exact_controller_readback(leaf, &journal, false)?;
+        return Ok(());
+    }
+    if matches!(
+        journal.state,
+        ControllerTransactionState::Degraded | ControllerTransactionState::AbandonedForExactDelete
+    ) {
+        return Err(format!(
+            "Host controller rollback cannot continue from {:?}: {}",
+            journal.state,
+            journal.degraded_reason.as_deref().unwrap_or("no reason")
+        ));
+    }
+    if journal.state != ControllerTransactionState::RollingBack {
+        journal.state = ControllerTransactionState::RollingBack;
+        persist(&journal)?;
+        failpoint("after-rollback-prepared")?;
+    }
+
+    let journal = load()?;
+    if journal.schema_version != CONTROLLER_JOURNAL_SCHEMA_VERSION
+        || journal.state != ControllerTransactionState::RollingBack
+    {
+        return Err("Host controller batch transaction changed before rollback".to_string());
+    }
+    for index in (0..journal.steps.len()).rev() {
+        let file = journal.steps[index].file.clone();
+        let old = journal.steps[index].old.clone();
+        let target = journal.steps[index].target.clone();
+        let actual = read_controller_value(leaf, &file)?;
+        if actual != old && actual != target {
+            let reason = format!(
+                "controller {} rollback readback is neither old {} nor target {}: {actual}",
+                file, old, target
+            );
+            let mut degraded = journal.clone();
+            mark_controller_degraded(&mut degraded, &reason);
+            persist(&degraded)?;
+            return Err(reason);
+        }
+        if actual == old {
+            continue;
+        }
+
+        failpoint(&format!("before-rollback-write-{file}"))?;
+        verify_claim()?;
+        let adjacent = read_controller_value(leaf, &file)?;
+        if adjacent != old && adjacent != target {
+            let reason = format!(
+                "controller {file} changed after cleanup fence and is neither old {old} nor target {target}: {adjacent}"
+            );
+            let mut degraded = journal.clone();
+            mark_controller_degraded(&mut degraded, &reason);
+            persist(&degraded)?;
+            return Err(reason);
+        }
+        if adjacent == old {
+            continue;
+        }
+        write_controller_value(leaf, &file, &old)?;
+        failpoint(&format!("after-rollback-write-{file}"))?;
+        failpoint(&format!("before-rollback-readback-{file}"))?;
+        let observed = read_controller_value(leaf, &file)?;
+        if observed != old {
+            if observed != target {
+                let reason = format!(
+                    "controller {} rollback readback is neither old {} nor target {}: {observed}",
+                    file, old, target
+                );
+                let mut degraded = journal.clone();
+                mark_controller_degraded(&mut degraded, &reason);
+                persist(&degraded)?;
+                return Err(reason);
+            }
+            return Err(format!(
+                "controller {} rollback readback mismatch: expected {}, found {observed}",
+                file, old
+            ));
+        }
+        failpoint(&format!("after-rollback-readback-{file}"))?;
+    }
+
+    failpoint("before-restored")?;
+    verify_claim()?;
+    let mut durable = load()?;
+    if durable.schema_version != CONTROLLER_JOURNAL_SCHEMA_VERSION
+        || durable.transaction_id != journal.transaction_id
+        || durable.state != ControllerTransactionState::RollingBack
+    {
+        return Err("Host controller batch transaction changed before restore commit".to_string());
+    }
+    exact_controller_readback(leaf, &durable, false)?;
+    durable.state = ControllerTransactionState::Restored;
+    persist(&durable)?;
+    failpoint("after-restored")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3789,6 +4122,10 @@ where
     F: FnMut(&HostCleanupJob) -> Result<(), String>,
 {
     let directory = queue.join(HOST_QUEUE_DIRECTORY);
+    // A single watchdog normally owns this queue, but the durable lock also
+    // serializes recovery if systemd briefly overlaps old/new watchdog
+    // generations. It remains a dotfile and is never itself a cleanup job.
+    let _queue_lock = RecordLock::acquire(&directory.join(".controller-recovery.lock"))?;
     let mut errors = Vec::new();
     for entry in fs::read_dir(&directory)
         .map_err(|error| format!("scan Host cleanup queue {}: {error}", directory.display()))?
@@ -5035,6 +5372,111 @@ fn wait_pidfd(pidfd: &OwnedFd, pid: i32, timeout: Duration) -> Result<(), String
 }
 
 fn reconcile_cleanup_controllers(path: &Path, job: &mut HostCleanupJob) -> Result<(), String> {
+    let leaf = Path::new("/sys/fs/cgroup").join(job.owner.target.cgroup().trim_start_matches('/'));
+    reconcile_cleanup_controllers_at(path, job, &leaf)
+}
+
+fn verify_cleanup_controller_job_identity(
+    path: &Path,
+    current: &HostCleanupJob,
+    expected: &HostCleanupJob,
+    transaction_id: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "stat Host cleanup controller job {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "Host cleanup controller job is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if path.file_name() != Some(OsStr::new(&format!("{}.json", expected.owner.generation)))
+        || current.owner.generation != expected.owner.generation
+        || !current.ready_for_cleanup
+        || current.socket != expected.socket
+        || current.created_at_ms != expected.created_at_ms
+        || current.lifecycle_root != expected.lifecycle_root
+    {
+        return Err(
+            "Host cleanup controller job generation or handoff identity changed".to_string(),
+        );
+    }
+
+    let mut current_owner = current.owner.clone();
+    let current_journal = current_owner
+        .controllers
+        .take()
+        .ok_or_else(|| "Host cleanup controller journal disappeared".to_string())?;
+    let mut expected_owner = expected.owner.clone();
+    let expected_journal = expected_owner
+        .controllers
+        .take()
+        .ok_or_else(|| "expected Host cleanup controller journal disappeared".to_string())?;
+    if current_owner != expected_owner
+        || current_journal.transaction_id != transaction_id
+        || current_journal.schema_version != expected_journal.schema_version
+        || current_journal.owner_epoch != expected_journal.owner_epoch
+        || !immutable_identity_matches(
+            &current_journal.owner_identity,
+            &expected_journal.owner_identity,
+        )
+        || current_journal.create_fingerprint != expected_journal.create_fingerprint
+        || current_journal.steps.len() != expected_journal.steps.len()
+        || current_journal
+            .steps
+            .iter()
+            .zip(&expected_journal.steps)
+            .any(|(current, expected)| {
+                current.file != expected.file
+                    || current.old != expected.old
+                    || current.target != expected.target
+            })
+    {
+        return Err(
+            "Host cleanup controller job immutable transaction identity changed".to_string(),
+        );
+    }
+    verify_controller_journal_owner(
+        &current_journal,
+        expected_journal.owner_epoch,
+        &expected_journal.owner_identity,
+        &expected_journal.create_fingerprint,
+    )
+}
+
+fn verify_cleanup_controller_write_claim(
+    path: &Path,
+    expected: &HostCleanupJob,
+    transaction_id: &str,
+    leaf: &Path,
+) -> Result<(), String> {
+    let current: HostCleanupJob = read_json(path)?;
+    verify_cleanup_controller_job_identity(path, &current, expected, transaction_id)?;
+    if !leaf.exists() {
+        return Err(format!(
+            "Host cleanup controller leaf disappeared before write: {}",
+            leaf.display()
+        ));
+    }
+    let parent_identity = expected
+        .owner
+        .target
+        .parent_identity()
+        .ok_or_else(|| "controller cleanup target has no parent identity".to_string())?;
+    verify_cgroup_cleanup_identity(leaf, parent_identity, expected.owner.target.leaf_identity())?;
+    verify_empty_cgroup(leaf)?;
+    verify_cgroup_cleanup_identity(leaf, parent_identity, expected.owner.target.leaf_identity())
+}
+
+fn reconcile_cleanup_controllers_at(
+    path: &Path,
+    job: &mut HostCleanupJob,
+    leaf: &Path,
+) -> Result<(), String> {
     let Some(journal) = job.owner.controllers.as_ref() else {
         return Ok(());
     };
@@ -5044,12 +5486,16 @@ fn reconcile_cleanup_controllers(path: &Path, job: &mut HostCleanupJob) -> Resul
         &journal.owner_identity,
         &journal.create_fingerprint,
     )?;
-    let leaf = Path::new("/sys/fs/cgroup").join(job.owner.target.cgroup().trim_start_matches('/'));
     if !leaf.exists() {
-        let journal = job.owner.controllers.as_mut().unwrap();
+        let transaction_id = journal.transaction_id.clone();
+        let expected = job.clone();
+        let mut current: HostCleanupJob = read_json(path)?;
+        verify_cleanup_controller_job_identity(path, &current, &expected, &transaction_id)?;
+        let journal = current.owner.controllers.as_mut().unwrap();
         journal.state = ControllerTransactionState::AbandonedForExactDelete;
         journal.degraded_reason = None;
-        persist_host_cleanup_job_exact(path, job)?;
+        persist_host_cleanup_job_exact(path, &current)?;
+        *job = current;
         return Ok(());
     }
     verify_cgroup_cleanup_identity(
@@ -5061,34 +5507,29 @@ fn reconcile_cleanup_controllers(path: &Path, job: &mut HostCleanupJob) -> Resul
         job.owner.target.leaf_identity(),
     )?;
     let transaction_id = journal.transaction_id.clone();
-    replay_controller_rollback(
+    let expected = job.clone();
+    replay_controller_rollback_with_failpoint(
         &leaf,
         || {
             let current: HostCleanupJob = read_json(path)?;
+            verify_cleanup_controller_job_identity(path, &current, &expected, &transaction_id)?;
             let journal = current
                 .owner
                 .controllers
                 .ok_or_else(|| "cleanup controller journal disappeared".to_string())?;
-            if journal.transaction_id != transaction_id {
-                return Err("cleanup controller transaction identity changed".to_string());
-            }
             Ok(journal)
         },
         |updated| {
             let mut current: HostCleanupJob = read_json(path)?;
-            if current
-                .owner
-                .controllers
-                .as_ref()
-                .is_none_or(|journal| journal.transaction_id != transaction_id)
-            {
-                return Err("cleanup controller transaction identity changed".to_string());
-            }
+            verify_cleanup_controller_job_identity(path, &current, &expected, &transaction_id)?;
             current.owner.controllers = Some(updated.clone());
             persist_host_cleanup_job_exact(path, &current)
         },
+        || verify_cleanup_controller_write_claim(path, &expected, &transaction_id, leaf),
+        |_| Ok(()),
     )?;
     let mut current: HostCleanupJob = read_json(path)?;
+    verify_cleanup_controller_job_identity(path, &current, &expected, &transaction_id)?;
     let journal = current
         .owner
         .controllers
@@ -6682,6 +7123,8 @@ mod tests {
             ("cpu.max", "max 100000"),
             ("pids.current", "1"),
             ("memory.current", "4096"),
+            ("cgroup.events", "populated 0\n"),
+            ("cgroup.procs", ""),
         ] {
             fs::write(root.join(file), value).unwrap();
         }
@@ -6728,6 +7171,56 @@ mod tests {
         (root, journal)
     }
 
+    fn controller_batch_fixture() -> (PathBuf, ControllerJournal) {
+        let (root, mut journal) = controller_fixture();
+        journal.schema_version = CONTROLLER_JOURNAL_SCHEMA_VERSION;
+        (root, journal)
+    }
+
+    fn controller_cleanup_job_fixture(
+        leaf: &Path,
+        journal: ControllerJournal,
+    ) -> (PathBuf, PathBuf, HostCleanupJob) {
+        let queue = std::env::temp_dir().join(format!(
+            "cube-host-controller-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let directory = queue.join(HOST_QUEUE_DIRECTORY);
+        fs::create_dir_all(&directory).unwrap();
+        let generation = format!("generation-{}", uuid::Uuid::new_v4());
+        let path = cleanup_queue_path(&queue, HOST_QUEUE_DIRECTORY, &generation);
+        let job = HostCleanupJob {
+            owner: HostCgroupOwner {
+                schema_version: SCHEMA_VERSION,
+                generation,
+                namespace: "k8s.io".to_string(),
+                instance_id: "a".repeat(64),
+                state: HostOwnerState::Allocated,
+                target: HostTarget::Cgroupfs {
+                    oci_path: "/fixture".to_string(),
+                    cgroup: "/fixture/leaf".to_string(),
+                    parent_identity: file_identity(leaf.parent().unwrap()).unwrap(),
+                    leaf_identity: Some(file_identity(leaf).unwrap()),
+                },
+                original_cgroup: "/fixture".to_string(),
+                server: None,
+                controllers: Some(journal),
+            },
+            socket: SocketIdentity {
+                path: queue.join("absent.sock").display().to_string(),
+                parent: file_identity(&queue).unwrap(),
+                device: None,
+                inode: None,
+                absent_at_prepare: true,
+            },
+            created_at_ms: unix_time_ms().unwrap(),
+            lifecycle_root: queue.join("absent-lifecycle").display().to_string(),
+            ready_for_cleanup: true,
+        };
+        atomic_write_json(&path, &job).unwrap();
+        (queue, path, job)
+    }
+
     #[test]
     fn controller_preflight_and_canonical_values_are_strict() {
         let (root, journal) = controller_fixture();
@@ -6772,6 +7265,652 @@ mod tests {
             assert_eq!(fs::read_to_string(root.join(file)).unwrap(), expected);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_journal_rejects_legacy_step_progress() {
+        let (root, journal) = controller_batch_fixture();
+        verify_controller_journal_owner(
+            &journal,
+            journal.owner_epoch,
+            &journal.owner_identity,
+            &journal.create_fingerprint,
+        )
+        .unwrap();
+
+        let mut invalid = journal.clone();
+        invalid.steps[0].state = ControllerStepState::Intent;
+        assert!(verify_controller_journal_owner(
+            &invalid,
+            invalid.owner_epoch,
+            &invalid.owner_identity,
+            &invalid.create_fingerprint,
+        )
+        .unwrap_err()
+        .contains("legacy step progress"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_forward_has_one_replay_commit() {
+        let (root, journal) = controller_batch_fixture();
+        let stored = std::cell::RefCell::new(journal);
+        let persistence_count = std::cell::Cell::new(0usize);
+        replay_controller_forward_state(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                persistence_count.set(persistence_count.get() + 1);
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let durable = stored.borrow().clone();
+        assert_eq!(persistence_count.get(), 1);
+        assert_eq!(
+            durable.state,
+            ControllerTransactionState::ControllersCommitted
+        );
+        assert!(durable.steps.iter().all(|step| {
+            step.state == ControllerStepState::NotStarted && step.observed.is_none()
+        }));
+        exact_controller_readback(&root, &durable, true).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_preparation_and_forward_have_two_total_commits() {
+        let (root, fixture) = controller_fixture();
+        let targets = [
+            ("memory.oom.group", "1".to_string()),
+            ("pids.max", "512".to_string()),
+            ("memory.max", "536870912".to_string()),
+            ("cpu.max", "125000 100000".to_string()),
+        ];
+        let journal = prepare_controller_batch_journal(
+            &root,
+            &targets,
+            fixture.owner_epoch,
+            &fixture.owner_identity,
+            &fixture.create_fingerprint,
+        )
+        .unwrap();
+        let path = root.join("two-commit-controller-journal.json");
+        let persistence_count = std::cell::Cell::new(0usize);
+        atomic_write_json(&path, &journal).unwrap();
+        persistence_count.set(1);
+        replay_controller_forward_state(
+            &root,
+            || read_json(&path),
+            |updated| {
+                persistence_count.set(persistence_count.get() + 1);
+                atomic_write_json(&path, updated)
+            },
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(persistence_count.get(), 2);
+        let durable: ControllerJournal = read_json(&path).unwrap();
+        assert_eq!(
+            durable.state,
+            ControllerTransactionState::ControllersCommitted
+        );
+        exact_controller_readback(&root, &durable, true).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_prepared_owner_atomic_commit_fails_before_external_writes() {
+        for stage in ["temp", "file-fsync", "rename", "parent-fsync"] {
+            let (root, journal) = controller_batch_fixture();
+            let directory = root.join(format!("owner-{stage}"));
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join(HOST_OWNER_FILE);
+            let mut owner = HostCgroupOwner {
+                schema_version: SCHEMA_VERSION,
+                generation: "generation".to_string(),
+                namespace: "k8s.io".to_string(),
+                instance_id: "a".repeat(64),
+                state: HostOwnerState::Allocated,
+                target: HostTarget::Legacy {
+                    cgroup: "/fixture".to_string(),
+                },
+                original_cgroup: "/fixture".to_string(),
+                server: None,
+                controllers: None,
+            };
+            atomic_write_json(&path, &owner).unwrap();
+            owner.controllers = Some(journal.clone());
+            fs::write(atomic_write_failpoint_path(&path, stage), b"fail").unwrap();
+            let result = persist_host_owner_exact(&directory, &owner);
+            if stage == "parent-fsync" {
+                result.unwrap();
+            } else {
+                assert!(result.unwrap_err().contains("injected failure"));
+                assert!(read_json::<HostCgroupOwner>(&path)
+                    .unwrap()
+                    .controllers
+                    .is_none());
+                persist_host_owner_exact(&directory, &owner).unwrap();
+            }
+            let durable: HostCgroupOwner = read_json(&path).unwrap();
+            assert_eq!(durable.controllers, Some(journal.clone()));
+            exact_controller_readback(&root, &journal, false).unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn controller_batch_forward_atomic_commit_matrix_converges() {
+        for stage in ["temp", "file-fsync", "rename", "parent-fsync"] {
+            let (root, journal) = controller_batch_fixture();
+            let journal_path = root.join("controller-batch-journal.json");
+            atomic_write_json(&journal_path, &journal).unwrap();
+            let armed = std::cell::Cell::new(true);
+            let error = replay_controller_forward_state(
+                &root,
+                || read_json(&journal_path),
+                |updated| {
+                    if armed.replace(false) {
+                        fs::write(atomic_write_failpoint_path(&journal_path, stage), b"fail")
+                            .unwrap();
+                    }
+                    atomic_write_json(&journal_path, updated)
+                },
+                || Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(error.contains("injected failure"), "{stage}: {error}");
+
+            replay_controller_forward_state(
+                &root,
+                || read_json(&journal_path),
+                |updated| atomic_write_json(&journal_path, updated),
+                || Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let durable: ControllerJournal = read_json(&journal_path).unwrap();
+            assert_eq!(
+                durable.state,
+                ControllerTransactionState::ControllersCommitted
+            );
+            exact_controller_readback(&root, &durable, true).unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn controller_batch_forward_crash_matrix_converges_without_step_commits() {
+        let mut crash_points = vec![
+            "before-controllers-committed".to_string(),
+            "after-controllers-committed".to_string(),
+        ];
+        for file in ["memory.oom.group", "pids.max", "memory.max", "cpu.max"] {
+            for boundary in [
+                "before-write",
+                "after-write",
+                "before-readback",
+                "after-readback",
+            ] {
+                crash_points.push(format!("{boundary}-{file}"));
+            }
+        }
+
+        for crash_point in crash_points {
+            let (root, journal) = controller_batch_fixture();
+            let stored = Arc::new(std::sync::Mutex::new(journal));
+            let persistence_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let armed = std::cell::Cell::new(true);
+            let error = replay_controller_forward_state(
+                &root,
+                {
+                    let stored = Arc::clone(&stored);
+                    move || Ok(stored.lock().unwrap().clone())
+                },
+                {
+                    let stored = Arc::clone(&stored);
+                    let persistence_count = Arc::clone(&persistence_count);
+                    move |updated| {
+                        persistence_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        *stored.lock().unwrap() = updated.clone();
+                        Ok(())
+                    }
+                },
+                || Ok(()),
+                |name| {
+                    if armed.get() && name == crash_point {
+                        armed.set(false);
+                        Err(format!("injected crash at {name}"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains(&crash_point), "{crash_point}: {error}");
+
+            replay_controller_forward_state(
+                &root,
+                {
+                    let stored = Arc::clone(&stored);
+                    move || Ok(stored.lock().unwrap().clone())
+                },
+                {
+                    let stored = Arc::clone(&stored);
+                    move |updated| {
+                        *stored.lock().unwrap() = updated.clone();
+                        Ok(())
+                    }
+                },
+                || Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let durable = stored.lock().unwrap().clone();
+            assert_eq!(
+                durable.state,
+                ControllerTransactionState::ControllersCommitted
+            );
+            assert!(
+                persistence_count.load(std::sync::atomic::Ordering::Relaxed) <= 1,
+                "{crash_point}"
+            );
+            exact_controller_readback(&root, &durable, true).unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn controller_batch_forward_and_rollback_degrade_on_foreign_values() {
+        let (root, journal) = controller_batch_fixture();
+        fs::write(root.join("memory.max"), "123456").unwrap();
+        let stored = std::cell::RefCell::new(journal);
+        let error = replay_controller_forward_state(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("neither old"));
+        let degraded_reason = stored.borrow().degraded_reason.clone();
+        assert_eq!(stored.borrow().state, ControllerTransactionState::Degraded);
+        assert!(replay_controller_rollback(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .contains("cannot continue"));
+        assert_eq!(stored.borrow().degraded_reason, degraded_reason);
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, mut journal) = controller_batch_fixture();
+        journal.state = ControllerTransactionState::ControllersCommitted;
+        for step in &journal.steps {
+            fs::write(root.join(&step.file), &step.target).unwrap();
+        }
+        fs::write(root.join("memory.max"), "123456").unwrap();
+        let stored = std::cell::RefCell::new(journal);
+        let error = replay_controller_rollback(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("neither old"));
+        assert_eq!(stored.borrow().state, ControllerTransactionState::Degraded);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_prepared_mixed_values_follow_cleanup_rollback_direction() {
+        let (root, journal) = controller_batch_fixture();
+        for step in journal.steps.iter().take(2) {
+            fs::write(root.join(&step.file), &step.target).unwrap();
+        }
+        let stored = std::cell::RefCell::new(journal);
+        let persistence_count = std::cell::Cell::new(0usize);
+        replay_controller_rollback(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                persistence_count.set(persistence_count.get() + 1);
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let durable = stored.borrow().clone();
+        assert_eq!(persistence_count.get(), 2);
+        assert_eq!(durable.state, ControllerTransactionState::Restored);
+        exact_controller_readback(&root, &durable, false).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_readback_foreign_value_is_durably_degraded() {
+        let (root, journal) = controller_batch_fixture();
+        let stored = std::cell::RefCell::new(journal);
+        let injected = std::cell::Cell::new(false);
+        let error = replay_controller_forward_state(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+            || Ok(()),
+            |name| {
+                if !injected.get() && name == "before-readback-pids.max" {
+                    injected.set(true);
+                    fs::write(root.join("pids.max"), "777").unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("target readback is neither old"));
+        assert_eq!(stored.borrow().state, ControllerTransactionState::Degraded);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_owner_fence_rechecks_third_value_before_write() {
+        let (root, journal) = controller_batch_fixture();
+        fs::write(root.join("memory.oom.group"), "1").unwrap();
+        let stored = std::cell::RefCell::new(journal);
+        let injected = std::cell::Cell::new(false);
+        let error = replay_controller_forward_state(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+            || {
+                if !injected.replace(true) {
+                    fs::write(root.join("pids.max"), "777").unwrap();
+                }
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("changed after owner fence"));
+        assert_eq!(read_controller_value(&root, "pids.max").unwrap(), "777");
+        assert_eq!(stored.borrow().state, ControllerTransactionState::Degraded);
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, mut journal) = controller_batch_fixture();
+        journal.state = ControllerTransactionState::ControllersCommitted;
+        for step in &journal.steps {
+            fs::write(root.join(&step.file), &step.target).unwrap();
+        }
+        let stored = std::cell::RefCell::new(journal);
+        let injected = std::cell::Cell::new(false);
+        let error = replay_controller_rollback_with_failpoint(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+            || {
+                if !injected.replace(true) {
+                    fs::write(root.join("cpu.max"), "333 100000").unwrap();
+                }
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("changed after cleanup fence"));
+        assert_eq!(
+            read_controller_value(&root, "cpu.max").unwrap(),
+            "333 100000"
+        );
+        assert_eq!(stored.borrow().state, ControllerTransactionState::Degraded);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_revoked_claim_fences_forward_and_rollback_writes() {
+        let (root, journal) = controller_batch_fixture();
+        let stored = std::cell::RefCell::new(journal);
+        let error = replay_controller_forward_state(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+            || Err("operation owner epoch was revoked".to_string()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("epoch was revoked"));
+        exact_controller_readback(&root, &stored.borrow(), false).unwrap();
+        assert_eq!(stored.borrow().state, ControllerTransactionState::Prepared);
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, mut journal) = controller_batch_fixture();
+        journal.state = ControllerTransactionState::ControllersCommitted;
+        for step in &journal.steps {
+            fs::write(root.join(&step.file), &step.target).unwrap();
+        }
+        let stored = std::cell::RefCell::new(journal);
+        let error = replay_controller_rollback_with_failpoint(
+            &root,
+            || Ok(stored.borrow().clone()),
+            |updated| {
+                *stored.borrow_mut() = updated.clone();
+                Ok(())
+            },
+            || Err("cleanup generation was revoked".to_string()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("generation was revoked"));
+        exact_controller_readback(&root, &stored.borrow(), true).unwrap();
+        assert_eq!(
+            stored.borrow().state,
+            ControllerTransactionState::RollingBack
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_controller_recovery_fences_job_identity_population_and_leaf_generation() {
+        let (leaf, mut journal) = controller_batch_fixture();
+        for step in journal.steps.iter().take(2) {
+            fs::write(leaf.join(&step.file), &step.target).unwrap();
+        }
+        journal.state = ControllerTransactionState::Prepared;
+        let transaction_id = journal.transaction_id.clone();
+        let (queue, path, mut job) = controller_cleanup_job_fixture(&leaf, journal);
+        let expected = job.clone();
+        verify_cleanup_controller_write_claim(&path, &expected, &transaction_id, &leaf).unwrap();
+
+        fs::write(leaf.join("cgroup.events"), "populated 1\n").unwrap();
+        assert!(
+            verify_cleanup_controller_write_claim(&path, &expected, &transaction_id, &leaf)
+                .unwrap_err()
+                .contains("still populated")
+        );
+        fs::write(leaf.join("cgroup.events"), "populated 0\n").unwrap();
+
+        let mut changed: HostCleanupJob = read_json(&path).unwrap();
+        changed.owner.instance_id = "b".repeat(64);
+        atomic_write_json(&path, &changed).unwrap();
+        assert!(
+            verify_cleanup_controller_write_claim(&path, &expected, &transaction_id, &leaf)
+                .unwrap_err()
+                .contains("identity changed")
+        );
+        atomic_write_json(&path, &expected).unwrap();
+
+        let replacement = leaf.with_extension("replacement");
+        fs::rename(&leaf, &replacement).unwrap();
+        fs::create_dir(&leaf).unwrap();
+        for entry in fs::read_dir(&replacement).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                fs::copy(entry.path(), leaf.join(entry.file_name())).unwrap();
+            }
+        }
+        assert!(
+            verify_cleanup_controller_write_claim(&path, &expected, &transaction_id, &leaf)
+                .unwrap_err()
+                .contains("identity")
+        );
+        fs::remove_dir_all(&leaf).unwrap();
+        fs::rename(&replacement, &leaf).unwrap();
+
+        reconcile_cleanup_controllers_at(&path, &mut job, &leaf).unwrap();
+        assert!(job.owner.controllers.is_none());
+        let durable: HostCleanupJob = read_json(&path).unwrap();
+        assert!(durable.owner.controllers.is_none());
+        for step in expected.owner.controllers.as_ref().unwrap().steps.iter() {
+            assert_eq!(read_controller_value(&leaf, &step.file).unwrap(), step.old);
+        }
+        fs::remove_dir_all(leaf).unwrap();
+        fs::remove_dir_all(queue).unwrap();
+    }
+
+    #[test]
+    fn controller_batch_rollback_crash_matrix_converges() {
+        let mut crash_points = vec![
+            "after-rollback-prepared".to_string(),
+            "before-restored".to_string(),
+            "after-restored".to_string(),
+        ];
+        for file in ["memory.oom.group", "pids.max", "memory.max", "cpu.max"] {
+            for boundary in [
+                "before-rollback-write",
+                "after-rollback-write",
+                "before-rollback-readback",
+                "after-rollback-readback",
+            ] {
+                crash_points.push(format!("{boundary}-{file}"));
+            }
+        }
+
+        for crash_point in crash_points {
+            let (root, mut journal) = controller_batch_fixture();
+            journal.state = ControllerTransactionState::ControllersCommitted;
+            for step in &journal.steps {
+                fs::write(root.join(&step.file), &step.target).unwrap();
+            }
+            let stored = Arc::new(std::sync::Mutex::new(journal));
+            let armed = std::cell::Cell::new(true);
+            let error = replay_controller_rollback_with_failpoint(
+                &root,
+                {
+                    let stored = Arc::clone(&stored);
+                    move || Ok(stored.lock().unwrap().clone())
+                },
+                {
+                    let stored = Arc::clone(&stored);
+                    move |updated| {
+                        *stored.lock().unwrap() = updated.clone();
+                        Ok(())
+                    }
+                },
+                || Ok(()),
+                |name| {
+                    if armed.get() && name == crash_point {
+                        armed.set(false);
+                        Err(format!("injected crash at {name}"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains(&crash_point), "{crash_point}: {error}");
+
+            replay_controller_rollback(
+                &root,
+                {
+                    let stored = Arc::clone(&stored);
+                    move || Ok(stored.lock().unwrap().clone())
+                },
+                {
+                    let stored = Arc::clone(&stored);
+                    move |updated| {
+                        *stored.lock().unwrap() = updated.clone();
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+            let durable = stored.lock().unwrap().clone();
+            assert_eq!(durable.state, ControllerTransactionState::Restored);
+            exact_controller_readback(&root, &durable, false).unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn controller_batch_rollback_atomic_commit_matrix_converges() {
+        for persistence_index in 1..=2 {
+            for stage in ["temp", "file-fsync", "rename", "parent-fsync"] {
+                let (root, mut journal) = controller_batch_fixture();
+                journal.state = ControllerTransactionState::ControllersCommitted;
+                for step in &journal.steps {
+                    fs::write(root.join(&step.file), &step.target).unwrap();
+                }
+                let journal_path = root.join("controller-batch-rollback.json");
+                atomic_write_json(&journal_path, &journal).unwrap();
+                let persistence_count = std::cell::Cell::new(0usize);
+                let error = replay_controller_rollback(
+                    &root,
+                    || read_json(&journal_path),
+                    |updated| {
+                        persistence_count.set(persistence_count.get() + 1);
+                        if persistence_count.get() == persistence_index {
+                            fs::write(atomic_write_failpoint_path(&journal_path, stage), b"fail")
+                                .unwrap();
+                        }
+                        atomic_write_json(&journal_path, updated)
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains("injected failure"),
+                    "{persistence_index}/{stage}: {error}"
+                );
+
+                replay_controller_rollback(
+                    &root,
+                    || read_json(&journal_path),
+                    |updated| atomic_write_json(&journal_path, updated),
+                )
+                .unwrap();
+                let durable: ControllerJournal = read_json(&journal_path).unwrap();
+                assert_eq!(durable.state, ControllerTransactionState::Restored);
+                exact_controller_readback(&root, &durable, false).unwrap();
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[test]
