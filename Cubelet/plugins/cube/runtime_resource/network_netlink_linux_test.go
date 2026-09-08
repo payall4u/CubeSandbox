@@ -471,6 +471,57 @@ func TestNetlinkNetworkPollsAfterAsynchronousGatewayProbe(t *testing.T) {
 	}
 }
 
+func TestNetlinkNetworkAllowsDelayedGatewayNeighborPublication(t *testing.T) {
+	handle := newFakeNetlinkHandle()
+	configureFakeDualStack(t, handle)
+	handle.eventualNeigh = slices.Clone(handle.neighbors)
+	handle.neighbors = nil
+	// Sixteen reads require at least fifteen 2ms poll intervals. This models
+	// the delayed Cilium publication seen under concurrent Pod startup and
+	// guards against the former 20ms deadline.
+	handle.neighAfterRead = 16
+	network := &netlinkNetwork{executor: &fakeNetlinkExecutor{handle: handle}, probe: func(context.Context, string, net.IP) error {
+		return nil
+	}}
+	attachment, err := network.Prepare(context.Background(), t.TempDir(), "eth0", "cb123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handle.neighborReads != 16 || len(attachment.GetNeighbors()) != 2 {
+		t.Fatalf("reads=%d neighbors=%+v", handle.neighborReads, attachment.GetNeighbors())
+	}
+}
+
+func TestAdapterRollsBackWhenGatewayNeighborNeverAppears(t *testing.T) {
+	handle := newFakeNetlinkHandle()
+	configureFakeDualStack(t, handle)
+	handle.neighbors = nil
+	network := &netlinkNetwork{executor: &fakeNetlinkExecutor{handle: handle}, probe: func(context.Context, string, net.IP) error {
+		return nil
+	}}
+	adapter, err := newAdapter(filepath.Join(t.TempDir(), "resources"), testAssets(t), network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := adapterRequest()
+	request.Network.NetnsPath = t.TempDir()
+	tapName := nameFor("cb", request.GetSandboxId(), request.GetGeneration())
+	started := time.Now()
+	_, err = adapter.Prepare(context.Background(), request, state.Lease{Generation: 3, LeaseID: "lease-a"})
+	if err == nil || !strings.Contains(err.Error(), "gateway has no neighbor MAC") {
+		t.Fatalf("Prepare error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 200*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("bounded neighbor wait elapsed=%s", elapsed)
+	}
+	if _, exists := handle.links[tapName]; exists {
+		t.Fatal("TAP remains after failed Prepare rollback")
+	}
+	if _, err := adapter.load(request.GetSandboxId()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("adapter record remains after failed Prepare rollback: %v", err)
+	}
+}
+
 func TestNetlinkNetworkUsesClsactIngressParentForCreateAndRelease(t *testing.T) {
 	handle := newFakeNetlinkHandle()
 	configureFakeDualStack(t, handle)

@@ -32,7 +32,11 @@ const (
 	cniReadyPollInterval      = 2 * time.Millisecond
 	tapDeleteRetryLimit       = 3
 	tapDeleteRetryInterval    = time.Millisecond
-	neighborResolutionTimeout = 20 * time.Millisecond
+	// Cilium can publish the gateway neighbor asynchronously after CNI ADD.
+	// Keep this below the broader CNI readiness deadline, but long enough to
+	// absorb scheduler/load jitter; failing RunPodSandbox makes kubelet wait
+	// roughly ten seconds before retrying the entire sandbox creation.
+	neighborResolutionTimeout = 250 * time.Millisecond
 	neighborPollInterval      = 2 * time.Millisecond
 	neighborProbeInterval     = 5 * time.Millisecond
 	tapOwnershipAliasPrefix   = "cubesandbox-runtime-resource:"
